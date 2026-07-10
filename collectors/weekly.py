@@ -4,10 +4,10 @@ collectors/weekly.py
 Weekly metrics — written every Sunday night after Rippling sync completes.
 period_date = Monday of the prior week (the week just ended).
 
-  - brm_utilization_pct : From BPM Scorecard Billable Hour Util Rate (Rippling + PropertyMeld)
-  - wo_assigned_pct     : % of whole active meld pipeline that has been assigned (excl. projects)
-  - leasing_velocity    : Average days on market for units leased (CountersignedDate) in past 7 days
-  - sla_pct             : % of Missive conversations replied to within 24h (rolling 7d)
+  - brm_utilization_pct : Allocated Estimated Billable Hours from Work Logs / (tech_count × 40h)
+  - wo_assigned_pct     : % of whole active meld pipeline assigned (excl. project melds)
+  - leasing_velocity    : Avg days AvailableOn→CountersignedDate for new leases (excl. renewals)
+  - sla_pct             : Per-user SLA%, top 3 offenders in detail (prior Mon–Sun window)
 """
 
 from __future__ import annotations
@@ -23,103 +23,97 @@ from pyairtable import Api
 from airtable_writer import MetricSnapshot, _today
 
 
-AFP_BASE_ID      = os.environ.get("AFP_BASE_ID",      "appg8MZ0eQP6CFyfZ")
-SCORECARD_BASE_ID = os.environ.get("SCORECARD_BASE_ID","appAwZySwIwQT0G0a")
-MISSIVE_TOKEN    = os.environ.get("MISSIVE_TOKEN", "")
-MISSIVE_BASE     = "https://public.missiveapp.com/v1"
-BRM_TARGET_PCT   = 85.0
+AFP_BASE_ID    = os.environ.get("AFP_BASE_ID", "appg8MZ0eQP6CFyfZ")
+MISSIVE_TOKEN  = os.environ.get("MISSIVE_TOKEN", "")
+MISSIVE_BASE   = "https://public.missiveapp.com/v1"
+BRM_TARGET_PCT = 85.0
 
-TEAM_INBOXES = {
-    "9a7adab1-5e02-4ca7-9d60-306fc274d186": "Finance",
-    "4e3e2112-7a52-4cba-a77d-d25142def86d": "Maintenance",
-    "6c4c0b77-67e7-443f-be30-c66bb6e87e8e": "Marketing",
-    "fb007418-7e6a-4db5-bf41-b1f8a3fddeeb": "Office",
-    "27036b84-8fc4-480b-9334-94195631fd5b": "Property Management",
-    "891298e2-2a54-47d8-ba83-ff007a8f751b": "Rentals/Leasing",
-    "01ccca67-ec22-4627-ba23-a567fac25a98": "Sales",
-}
+# Service/bot accounts to exclude from SLA reporting
+SKIP_USER_NAMES = {"BPM-DOS Team", "Reva Nowell", "Evan Mayo", "Jesse Leichtentritt"}
 
 
 def collect(api_key: str) -> list[MetricSnapshot]:
     now = datetime.now(timezone.utc)
-    # Monday of the prior full week
     days_since_monday = now.weekday()
     prior_monday = (now - timedelta(days=days_since_monday + 7)).date()
-    prior_sunday_str = (prior_monday + timedelta(days=6)).isoformat()
+    prior_sunday = prior_monday + timedelta(days=6)
     prior_monday_str = prior_monday.isoformat()
+    prior_sunday_str = prior_sunday.isoformat()
 
     snapshots = []
-    snapshots += _brm_utilization(api_key, prior_monday_str, prior_monday)
+    snapshots += _brm_utilization(api_key, prior_monday_str, prior_monday, prior_sunday_str)
     snapshots += _wo_assigned(api_key, prior_monday)
-    snapshots += _leasing_velocity(api_key, prior_monday)
-    snapshots += _sla(prior_monday)
+    snapshots += _leasing_velocity(api_key, prior_monday, prior_monday + timedelta(days=6), prior_monday)
+    snapshots += _sla(prior_monday, prior_monday, prior_sunday)
     return snapshots
 
 
 # ---------------------------------------------------------------------------
-# BRM Utilization
+# BRM Utilization — Work Logs only (Allocated Estimated Billable Hours)
 # ---------------------------------------------------------------------------
 
-def _brm_utilization(api_key: str, week_start_str: str, week_date: date) -> list[MetricSnapshot]:
-    try:
-        sc_key = os.environ.get("AFP_API_KEY") or api_key
-        table = Api(sc_key).base(SCORECARD_BASE_ID).table("Billable Hour Util Rate")
-        rows = table.all(
-            fields=["Week", "Tech Name", "Worked Hours", "Total Billed Hours"],
-            formula=f"{{Week}} = '{week_start_str}'",
-        )
-        if rows:
-            total_worked = sum(float(r["fields"].get("Worked Hours") or 0) for r in rows)
-            total_billed = sum(float(r["fields"].get("Total Billed Hours") or 0) for r in rows)
-            if total_worked > 0:
-                pct = round(total_billed / total_worked * 100, 2)
-                tech_lines = []
-                for r in rows:
-                    f = r["fields"]
-                    w = float(f.get("Worked Hours") or 0)
-                    b = float(f.get("Total Billed Hours") or 0)
-                    tech_pct = round(b / w * 100, 1) if w > 0 else 0
-                    tech_lines.append(f"{f.get('Tech Name','?')}: {b:.1f}h / {w:.1f}h = {tech_pct}%")
-                return [MetricSnapshot(
-                    metric="brm_utilization_pct",
-                    category="Weekly KPI",
-                    source="Airtable",
-                    value=pct,
-                    secondary_value=total_billed,
-                    target=BRM_TARGET_PCT,
-                    value_text=f"{pct}% ({total_billed:.1f}h billed / {total_worked:.1f}h worked)",
-                    detail="\n".join(tech_lines),
-                    status=_util_status(pct),
-                    period_date=week_date,
-                )]
-    except Exception as e:
-        print(f"  [weekly] Scorecard read failed: {e}")
-
-    # Fallback: work logs only
+def _brm_utilization(api_key: str, week_start_str: str, week_date: date,
+                     week_end_str: str) -> list[MetricSnapshot]:
     try:
         afp_key = os.environ.get("AFP_API_KEY") or api_key
         logs = Api(afp_key).base(AFP_BASE_ID).table("Work Logs").all(
-            fields=["Allocated Estimated Billable Hours"],
-            formula=f"AND(IS_AFTER({{CheckIn}}, '{week_start_str}'), IS_BEFORE({{CheckIn}}, '{(week_date + timedelta(days=7)).isoformat()}'))",
+            fields=["Allocated Estimated Billable Hours", "TechName"],
+            formula=(
+                f"AND("
+                f"IS_AFTER({{CheckIn}}, '{week_start_str}'), "
+                f"IS_BEFORE({{CheckIn}}, '{week_end_str}')"
+                f")"
+            ),
         )
-        total = sum(float(r["fields"].get("Allocated Estimated Billable Hours") or 0) for r in logs)
-        return [MetricSnapshot(
-            metric="brm_utilization_pct",
-            category="Weekly KPI",
-            source="Airtable",
-            value=total,
-            target=BRM_TARGET_PCT,
-            value_text=f"{total:.1f}h billed (Rippling hours not yet in Scorecard)",
-            status="Warning",
-            period_date=week_date,
-        )]
+
+        # Sum billed hours and break down by tech
+        tech_hours: dict[str, float] = {}
+        for rec in logs:
+            f = rec["fields"]
+            hrs = float(f.get("Allocated Estimated Billable Hours") or 0)
+            tech = (f.get("TechName") or "Unknown").strip()
+            tech_hours[tech] = tech_hours.get(tech, 0) + hrs
+
+        total_billed = sum(tech_hours.values())
+        tech_count = int(os.environ.get("BRM_TECH_COUNT", "0"))
+        hours_per_tech = float(os.environ.get("BRM_HOURS_PER_TECH_WEEK", "40"))
+
+        detail_lines = [f"{tech}: {hrs:.1f}h" for tech, hrs in sorted(tech_hours.items())]
+
+        if tech_count > 0:
+            available = tech_count * hours_per_tech
+            pct = round(min(total_billed / available * 100, 100), 2)
+            return [MetricSnapshot(
+                metric="brm_utilization_pct",
+                category="Weekly KPI",
+                source="Airtable",
+                value=pct,
+                secondary_value=total_billed,
+                target=BRM_TARGET_PCT,
+                value_text=f"{pct}% ({total_billed:.1f}h billed / {available:.0f}h available)",
+                detail="\n".join(detail_lines),
+                status=_util_status(pct),
+                period_date=week_date,
+            )]
+        else:
+            return [MetricSnapshot(
+                metric="brm_utilization_pct",
+                category="Weekly KPI",
+                source="Airtable",
+                value=total_billed,
+                target=BRM_TARGET_PCT,
+                value_text=f"{total_billed:.1f}h billed (set BRM_TECH_COUNT for %)",
+                detail="\n".join(detail_lines),
+                status="Warning",
+                period_date=week_date,
+            )]
     except Exception as e:
-        print(f"  [weekly] Work logs fallback failed: {e}")
-        return []
+        print(f"  [weekly] brm_utilization failed: {e}")
+    return []
 
 
 # ---------------------------------------------------------------------------
-# WOs Assigned %
+# WOs Assigned % — whole pipeline, exclude project melds
 # ---------------------------------------------------------------------------
 
 def _wo_assigned(api_key: str, week_date: date) -> list[MetricSnapshot]:
@@ -127,10 +121,11 @@ def _wo_assigned(api_key: str, week_date: date) -> list[MetricSnapshot]:
         afp_key = os.environ.get("AFP_API_KEY") or api_key
         all_melds = Api(afp_key).base(AFP_BASE_ID).table("Melds (Spine)").all(
             fields=["AssignedAt", "ProjectID", "IsActive"],
-            formula="AND({IsActive}, OR(ProjectID = '', ProjectID = BLANK()))",
+            formula="AND({IsActive}, OR({ProjectID} = '', {ProjectID} = BLANK()))",
         )
         total = len(all_melds)
-        assigned = sum(1 for r in all_melds if r["fields"].get("AssignedAt") not in (None, "", "None"))
+        assigned = sum(1 for r in all_melds
+                       if r["fields"].get("AssignedAt") not in (None, "", "None"))
         if total > 0:
             pct = round(assigned / total * 100, 2)
             return [MetricSnapshot(
@@ -148,138 +143,228 @@ def _wo_assigned(api_key: str, week_date: date) -> list[MetricSnapshot]:
 
 
 # ---------------------------------------------------------------------------
-# Leasing Velocity — avg days on market for units leased in past 7 days
+# Leasing Velocity — avg days from AvailableOn to CountersignedDate
 # ---------------------------------------------------------------------------
 
-def _leasing_velocity(api_key: str, week_date: date) -> list[MetricSnapshot]:
+def _leasing_velocity(api_key: str, week_start: date, week_end: date,
+                      week_date: date) -> list[MetricSnapshot]:
     try:
         afp_key = os.environ.get("AFP_API_KEY") or api_key
-        afp = Api(afp_key).base(AFP_BASE_ID)
+        airtable = Api(afp_key)
 
-        cutoff = (datetime.now(timezone.utc) - timedelta(days=7)).strftime("%Y-%m-%d")
-
-        # Leases countersigned in the past 7 days (new leases executed)
-        recent_leases = afp.table("Leases (Spine)").all(
-            fields=["CountersignedDate", "Unit", "UnitExternalID"],
+        # Fetch new leases (no renewals) countersigned in the prior week
+        leases = airtable.base(AFP_BASE_ID).table("Leases (Spine)").all(
+            fields=["CountersignedDate", "UnitExternalID", "IsRenewal"],
             formula=(
                 f"AND("
-                f"IS_AFTER({{CountersignedDate}}, '{cutoff}'), "
-                f"{{CountersignedDate}} != '', "
-                f"{{IsActive}}"
+                f"IS_AFTER({{CountersignedDate}}, '{(week_start - timedelta(days=1)).isoformat()}'), "
+                f"IS_BEFORE({{CountersignedDate}}, '{(week_end + timedelta(days=1)).isoformat()}'), "
+                f"NOT({{IsRenewal}})"
                 f")"
             ),
         )
 
-        if not recent_leases:
+        if not leases:
             return [MetricSnapshot(
                 metric="leasing_velocity",
                 category="Weekly KPI",
                 source="Airtable",
-                value=None,
-                value_text="No units leased this week",
+                value=0.0,
+                secondary_value=0.0,
+                value_text="0 leases countersigned this week",
+                status="OK",
+                period_date=week_date,
+            )]
+
+        # Map UnitExternalID → CountersignedDate (first encountered wins)
+        unit_countersigned: dict[str, date] = {}
+        for rec in leases:
+            f = rec["fields"]
+            uid = (f.get("UnitExternalID") or "").strip()
+            cs_raw = f.get("CountersignedDate") or ""
+            if not uid or not cs_raw:
+                continue
+            try:
+                cs_date = date.fromisoformat(cs_raw[:10])
+            except ValueError:
+                continue
+            if uid not in unit_countersigned:
+                unit_countersigned[uid] = cs_date
+
+        lease_count = len(leases)
+        unit_ids = list(unit_countersigned.keys())
+
+        # Fetch units in chunks of 50 — just match by ExternalID and require AvailableOn.
+        # Do NOT filter by PostedToWebsite/PostedToInternet: those booleans are cleared
+        # after a unit is leased, so filtering on them would return zero results.
+        available_on: dict[str, date] = {}
+        chunk_size = 50
+        for i in range(0, len(unit_ids), chunk_size):
+            chunk = unit_ids[i : i + chunk_size]
+            id_clauses = ", ".join(f"{{ExternalID}}='{uid}'" for uid in chunk)
+            formula = f"OR({id_clauses})" if len(chunk) > 1 else id_clauses
+            units = airtable.base(AFP_BASE_ID).table("Units (Spine)").all(
+                fields=["ExternalID", "AvailableOn"],
+                formula=formula,
+            )
+
+            for rec in units:
+                f = rec["fields"]
+                uid = (f.get("ExternalID") or "").strip()
+                ao_raw = f.get("AvailableOn") or ""
+                if not uid or not ao_raw:
+                    continue
+                try:
+                    available_on[uid] = date.fromisoformat(ao_raw[:10])
+                except ValueError:
+                    continue
+
+        # Compute days-to-lease per unit
+        days_list: list[int] = []
+        for uid, cs_date in unit_countersigned.items():
+            ao = available_on.get(uid)
+            if ao is None:
+                continue
+            days = (cs_date - ao).days
+            if 0 <= days <= 365:
+                days_list.append(days)
+
+        if not days_list:
+            return [MetricSnapshot(
+                metric="leasing_velocity",
+                category="Weekly KPI",
+                source="Airtable",
+                value=0.0,
+                secondary_value=float(lease_count),
+                value_text=f"{lease_count} lease(s) countersigned; no eligible units with AvailableOn",
                 status="Warning",
                 period_date=week_date,
             )]
 
-        # Build map of unit ExternalID → AvailableOn
-        unit_ext_ids = list({
-            r["fields"].get("UnitExternalID")
-            for r in recent_leases
-            if r["fields"].get("UnitExternalID")
-        })
-
-        # Fetch AvailableOn for those units
-        id_filter = "OR(" + ", ".join(f"{{ExternalID}} = '{uid}'" for uid in unit_ext_ids) + ")"
-        units = afp.table("Units (Spine)").all(
-            fields=["ExternalID", "AvailableOn"],
-            formula=id_filter,
-        )
-        available_on_map = {
-            r["fields"]["ExternalID"]: r["fields"].get("AvailableOn")
-            for r in units
-            if r["fields"].get("ExternalID")
-        }
-
-        dom_values: list[float] = []
-        for rec in recent_leases:
-            f = rec["fields"]
-            countersigned = f.get("CountersignedDate")
-            unit_ext = f.get("UnitExternalID")
-            available = available_on_map.get(unit_ext) if unit_ext else None
-
-            if not countersigned or not available:
-                continue
-
-            try:
-                from datetime import date as date_type
-                d1 = date_type.fromisoformat(available)
-                d2 = date_type.fromisoformat(countersigned)
-                dom = (d2 - d1).days
-                if 0 <= dom <= 365:  # sanity cap
-                    dom_values.append(float(dom))
-            except (ValueError, TypeError):
-                continue
-
-        if not dom_values:
-            return []
-
-        avg_dom = round(sum(dom_values) / len(dom_values), 1)
+        avg_days = round(sum(days_list) / len(days_list), 1)
+        status = "OK" if avg_days <= 14 else ("Warning" if avg_days <= 30 else "Critical")
         return [MetricSnapshot(
             metric="leasing_velocity",
             category="Weekly KPI",
             source="Airtable",
-            value=avg_dom,
-            secondary_value=float(len(dom_values)),  # units leased this week
-            value_text=f"{avg_dom} days avg ({len(dom_values)} units leased)",
-            status="OK" if avg_dom <= 21 else ("Warning" if avg_dom <= 35 else "Critical"),
+            value=avg_days,
+            secondary_value=float(lease_count),
+            value_text=f"{avg_days}d avg ({lease_count} lease(s), {len(days_list)} with velocity data)",
+            status=status,
             period_date=week_date,
         )]
+
     except Exception as e:
         print(f"  [weekly] leasing_velocity failed: {e}")
     return []
 
 
 # ---------------------------------------------------------------------------
-# SLA % (Missive)
+# SLA % — per-user, top 3 offenders
 # ---------------------------------------------------------------------------
 
-def _sla(week_date: date) -> list[MetricSnapshot]:
+def _sla(week_date: date, prior_monday: date, prior_sunday: date) -> list[MetricSnapshot]:
     if not MISSIVE_TOKEN:
         return []
+
     headers = {
         "Authorization": f"Bearer {MISSIVE_TOKEN}",
         "Content-Type": "application/json",
         "Accept": "application/json",
     }
+
     try:
         org_id = _get_org_id(headers)
-        now = datetime.now(timezone.utc)
-        start_ts = int((now - timedelta(days=7)).timestamp())
-        end_ts = int(now.timestamp())
-        all_frt: list[dict] = []
-        reports = _fetch_reports_parallel(headers, org_id, start_ts, end_ts, list(TEAM_INBOXES.items()))
-        for team_name, report in reports.items():
-            sel = report.get("reports", report).get("selected_period", {})
+
+        # Discover users from recent conversations
+        users = _discover_users(headers, org_id)
+        if not users:
+            return []
+
+        start_ts = int(datetime(prior_monday.year, prior_monday.month, prior_monday.day,
+                                tzinfo=timezone.utc).timestamp())
+        end_ts   = int(datetime(prior_sunday.year, prior_sunday.month, prior_sunday.day,
+                                23, 59, 59, tzinfo=timezone.utc).timestamp())
+
+        # Fetch per-user analytics in parallel
+        reports = _fetch_reports_parallel(
+            headers, org_id, start_ts, end_ts,
+            list(users.items()), filter_key="users"
+        )
+
+        # Compute SLA% per user
+        user_sla: dict[str, float] = {}
+        for user_name, report in reports.items():
+            sel     = report.get("reports", report).get("selected_period", {})
             tallies = sel.get("global", {}).get("totals", {}).get("tallies", {})
-            all_frt.extend(tallies.get("first_reply_time_counts", []))
-        if all_frt:
-            _, _, sla_24h = _sla_pcts(all_frt)
-            if sla_24h is not None:
-                return [MetricSnapshot(
-                    metric="sla_pct",
-                    category="Weekly KPI",
-                    source="Missive",
-                    value=round(sla_24h, 1),
-                    status="OK" if sla_24h >= 95 else ("Warning" if sla_24h >= 80 else "Critical"),
-                    period_date=week_date,
-                )]
+            frt     = tallies.get("first_reply_time_counts", [])
+            if not frt:
+                continue
+            total = sum(i.get("v", 0) for i in frt)
+            if total == 0:
+                continue
+            b24h = {"1m","2m","3m","4m","5m","10m","15m","30m","45m",
+                    "1h","2h","3h","4h","6h","8h","10h","12h","24h"}
+            within_24h = sum(i.get("v", 0) for i in frt if i.get("d") in b24h)
+            user_sla[user_name] = round(within_24h / total * 100, 1)
+
+        if not user_sla:
+            return []
+
+        # Overall SLA (weighted average across all users)
+        overall = round(sum(user_sla.values()) / len(user_sla), 1)
+
+        # Bottom 3 offenders (lowest SLA%)
+        bottom3 = sorted(user_sla.items(), key=lambda x: x[1])[:3]
+        detail_lines = [f"{name}: {pct}%" for name, pct in bottom3]
+
+        return [MetricSnapshot(
+            metric="sla_pct",
+            category="Weekly KPI",
+            source="Missive",
+            value=overall,
+            detail="Bottom 3 SLA%:\n" + "\n".join(detail_lines),
+            status="OK" if overall >= 95 else ("Warning" if overall >= 80 else "Critical"),
+            period_date=week_date,
+        )]
+
     except Exception as e:
         print(f"  [weekly] sla failed: {e}")
     return []
 
 
+def _discover_users(headers: dict, org_id: str, pages: int = 2) -> dict:
+    """
+    Fetch recent conversations to discover user IDs.
+    Returns {user_id: user_name}, excluding service accounts.
+    """
+    users = {}
+    params = {"organization": org_id, "all": "true", "limit": 50}
+
+    for _ in range(pages):
+        resp = requests.get(f"{MISSIVE_BASE}/conversations", headers=headers,
+                            params=params, timeout=30)
+        if resp.status_code != 200:
+            break
+        convos = resp.json().get("conversations", [])
+        if not convos:
+            break
+        for c in convos:
+            for u in (c.get("users") or []):
+                uid  = u.get("id")
+                name = u.get("name") or u.get("email", "")
+                if uid and name and name not in SKIP_USER_NAMES:
+                    users[uid] = name
+        if len(convos) < 50:
+            break
+        oldest_ts = min(c.get("last_activity_at", 0) for c in convos)
+        params = {"organization": org_id, "all": "true", "limit": 50, "until": oldest_ts}
+
+    return users
+
+
 # ---------------------------------------------------------------------------
-# Helpers
+# Missive API helpers (mirrored from live.py)
 # ---------------------------------------------------------------------------
 
 def _get_org_id(headers):
@@ -288,9 +373,9 @@ def _get_org_id(headers):
     return r.json()["organizations"][0]["id"]
 
 
-def _submit_report(headers, org_id, start_ts, end_ts, team_id) -> str:
+def _submit_report(headers, org_id, start_ts, end_ts, filter_key, filter_id) -> str:
     payload = {"reports": {"organization": org_id, "start": start_ts, "end": end_ts,
-                           "time_zone": "America/New_York", "teams": [team_id]}}
+                           "time_zone": "America/New_York", filter_key: [filter_id]}}
     r = requests.post(f"{MISSIVE_BASE}/analytics/reports", headers=headers, json=payload, timeout=30)
     r.raise_for_status()
     return r.json()["reports"]["id"]
@@ -299,61 +384,49 @@ def _submit_report(headers, org_id, start_ts, end_ts, team_id) -> str:
 def _poll_report(headers, report_id, timeout=60) -> dict:
     url = f"{MISSIVE_BASE}/analytics/reports/{report_id}"
     deadline = time.time() + timeout
-    time.sleep(3)
+    time.sleep(5)
     while time.time() < deadline:
         r = requests.get(url, headers=headers, timeout=15)
         if r.status_code == 200:
             return r.json()
         if r.status_code not in (202, 404):
             r.raise_for_status()
-        time.sleep(3)
+        time.sleep(5)
     raise TimeoutError(f"Report {report_id} timed out")
 
 
-def _fetch_reports_parallel(headers, org_id, start_ts, end_ts, team_ids_names: list) -> dict:
+def _fetch_reports_parallel(headers, org_id, start_ts, end_ts, items: list,
+                             filter_key: str = "teams") -> dict:
     submitted = {}
-    for team_id, team_name in team_ids_names:
+    for entity_id, entity_name in items:
         try:
-            report_id = _submit_report(headers, org_id, start_ts, end_ts, team_id)
-            submitted[team_name] = report_id
+            rid = _submit_report(headers, org_id, start_ts, end_ts, filter_key, entity_id)
+            submitted[entity_name] = rid
         except Exception as e:
-            print(f"  [missive] Submit failed for {team_name}: {e}")
+            print(f"  [missive] Submit failed for {entity_name}: {e}")
         time.sleep(1.5)
 
     results = {}
-    with ThreadPoolExecutor(max_workers=len(submitted) or 1) as pool:
-        futures = {
-            pool.submit(_poll_report, headers, rid): name
-            for name, rid in submitted.items()
-        }
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = {pool.submit(_poll_report, headers, rid): name
+                   for name, rid in submitted.items()}
         for future in as_completed(futures):
-            team_name = futures[future]
+            name = futures[future]
             try:
-                results[team_name] = future.result()
+                results[name] = future.result()
             except Exception as e:
-                print(f"  [missive] Poll failed for {team_name}: {e}")
+                print(f"  [missive] Poll failed for {name}: {e}")
 
     return results
 
 
-def _sla_pcts(frt):
-    total = sum(i.get("v", 0) for i in frt)
-    if not total:
-        return None, None, None
-    b1h  = {"1m","2m","3m","4m","5m","10m","15m","30m","45m","1h"}
-    b4h  = b1h | {"2h","3h","4h"}
-    b24h = b4h | {"6h","8h","10h","12h","24h"}
-    c = lambda s: sum(i.get("v", 0) for i in frt if i.get("d") in s)
-    return c(b1h)/total*100, c(b4h)/total*100, c(b24h)/total*100
-
-
-def _util_status(pct):
+def _util_status(pct: float) -> str:
     if pct >= BRM_TARGET_PCT:       return "OK"
     if pct >= BRM_TARGET_PCT - 15:  return "Warning"
     return "Critical"
 
 
-def _assignment_status(pct):
+def _assignment_status(pct: float) -> str:
     if pct < 70:  return "Critical"
     if pct < 85:  return "Warning"
     return "OK"

@@ -126,10 +126,10 @@ class _BaseWriter:
 
         created = updated = 0
         if to_create:
-            self._table.batch_create(to_create)
+            self._table.batch_create(to_create, typecast=True)
             created = len(to_create)
         if to_update:
-            self._table.batch_update(to_update)
+            self._table.batch_update(to_update, typecast=True)
             updated = len(to_update)
 
         return {"upserted": created + updated, "created": created, "updated": updated}

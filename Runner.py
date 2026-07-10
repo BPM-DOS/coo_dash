@@ -16,7 +16,7 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 from airtable_writer import LiveWriter
-from collectors import live
+from collectors import live, touchpoint, utilization
 
 AIRTABLE_API_KEY = os.environ.get("AIRTABLE_API_KEY")
 if not AIRTABLE_API_KEY:
@@ -40,7 +40,9 @@ def main():
     print(f"COO Live ETL — {start.isoformat()}")
     print(f"{'='*50}")
 
-    snapshots = run_collector("live", live.collect, AIRTABLE_API_KEY)
+    snapshots  = run_collector("live",        live.collect,             AIRTABLE_API_KEY)
+    snapshots += run_collector("touchpoint", touchpoint.collect_live,  AIRTABLE_API_KEY)
+    snapshots += run_collector("utilization", utilization.collect,     AIRTABLE_API_KEY)
 
     if snapshots:
         writer = LiveWriter(api_key=AIRTABLE_API_KEY)

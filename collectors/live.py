@@ -4,29 +4,33 @@ collectors/live.py
 All live metrics — refreshed every 30 minutes.
 Pulls from: Melds (Spine), Tasks, Missive.
 
-  Maintenance Stalls:
-    - wo_not_triaged_24h    : Active melds still PENDING_ASSIGNMENT > 24h
-    - stalled_wo_72h        : Active melds assigned but not completed > 72h
-    - time_to_triage_hours  : Rolling 30d avg hours from creation → assignment
+  Maintenance Stalls (all exclude project melds; clocks start at next business hour):
+    - wo_not_triaged_24h    : Active melds still PENDING_ASSIGNMENT > 24 biz-hours
+    - stalled_wo_72h        : Active melds with no update in 72h (business-hour adjusted)
+    - time_to_triage_hours  : Rolling 30d avg business-hours from creation → assignment
 
   Execution:
-    - past_due_tasks        : Open tasks with Target Completion Date in the past
+    - past_due_tasks        : Tasks where Task Due = "Past Due"
 
   Communication:
-    - inboxes_over_50       : Team inboxes with estimated open conversations > 50
-    - oldest_message_age_hours : Age of oldest open Missive conversation
+    - inboxes_over_50       : Individual staff members with > 50 unarchived conversations
 """
 
 from __future__ import annotations
 
 import os
 import time
-from collections import Counter
-from datetime import datetime, timezone, timedelta
+from collections import defaultdict
+from datetime import datetime, timezone, timedelta, date
 
 import requests
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pyairtable import Api
+
+try:
+    from zoneinfo import ZoneInfo
+except ImportError:
+    from backports.zoneinfo import ZoneInfo
 
 from airtable_writer import MetricSnapshot, _today
 
@@ -37,19 +41,16 @@ MISSIVE_TOKEN = os.environ.get("MISSIVE_TOKEN", "")
 MISSIVE_BASE = "https://public.missiveapp.com/v1"
 INBOX_THRESHOLD = int(os.environ.get("MISSIVE_INBOX_THRESHOLD", "50"))
 
+ET = ZoneInfo("America/New_York")
+BIZ_START = 9   # 9am ET
+BIZ_END   = 17  # 5pm ET
+
 UNTRIAGED_STATUS = "PENDING_ASSIGNMENT"
-CLOSED_STATUSES = {"COMPLETED", "MANAGER_CANCELED", "TENANT_CANCELED", "CANCELLED", "CANCELED"}
+CLOSED_STATUSES  = {"COMPLETED", "MANAGER_CANCELED", "TENANT_CANCELED", "CANCELLED", "CANCELED"}
 DETAIL_CAP = 50
 
-TEAM_INBOXES = {
-    "9a7adab1-5e02-4ca7-9d60-306fc274d186": "Finance",
-    "4e3e2112-7a52-4cba-a77d-d25142def86d": "Maintenance",
-    "6c4c0b77-67e7-443f-be30-c66bb6e87e8e": "Marketing",
-    "fb007418-7e6a-4db5-bf41-b1f8a3fddeeb": "Office",
-    "27036b84-8fc4-480b-9334-94195631fd5b": "Property Management",
-    "891298e2-2a54-47d8-ba83-ff007a8f751b": "Rentals/Leasing",
-    "01ccca67-ec22-4627-ba23-a567fac25a98": "Sales",
-}
+# Service/bot accounts to exclude from individual inbox counts
+SKIP_USER_NAMES = {"BPM-DOS Team"}
 
 
 def collect(api_key: str) -> list[MetricSnapshot]:
@@ -58,6 +59,45 @@ def collect(api_key: str) -> list[MetricSnapshot]:
     snapshots += _execution(api_key)
     snapshots += _missive()
     return snapshots
+
+
+# ---------------------------------------------------------------------------
+# Business hours helper
+# ---------------------------------------------------------------------------
+
+def effective_biz_start(dt: datetime) -> datetime:
+    """
+    If dt falls during business hours (Mon-Fri 9am-5pm ET), return dt unchanged.
+    If dt is before 9am on a weekday, return 9am that day.
+    If dt is after 5pm or on a weekend, return 9am ET of the next business day.
+    """
+    if dt is None:
+        return None
+    dt_et = dt.astimezone(ET)
+    weekday = dt_et.weekday()  # 0=Mon … 6=Sun
+    hour    = dt_et.hour
+
+    if weekday < 5 and BIZ_START <= hour < BIZ_END:
+        return dt_et  # already in business hours
+
+    d = dt_et.date()
+
+    if weekday < 5 and hour < BIZ_START:
+        # Before 9am on a weekday — same day open
+        return datetime(d.year, d.month, d.day, BIZ_START, 0, 0, tzinfo=ET)
+
+    # After hours or weekend
+    if weekday == 4:    # Friday after hours → Monday
+        days_forward = 3
+    elif weekday == 5:  # Saturday → Monday
+        days_forward = 2
+    elif weekday == 6:  # Sunday → Monday
+        days_forward = 1
+    else:               # Mon–Thu after hours → next day
+        days_forward = 1
+
+    next_biz = d + timedelta(days=days_forward)
+    return datetime(next_biz.year, next_biz.month, next_biz.day, BIZ_START, 0, 0, tzinfo=ET)
 
 
 # ---------------------------------------------------------------------------
@@ -73,38 +113,58 @@ def _maintenance(api_key: str) -> list[MetricSnapshot]:
     cutoff_72h = now - timedelta(hours=72)
     cutoff_30d = now - timedelta(days=30)
 
+    # Exclude project-linked melds
     records = table.all(
         fields=["Status", "CreatedAt", "AssignedAt", "UpdatedAt",
-                "IsActive", "ReferenceID", "BriefDescription", "Origin"],
-        formula="{IsActive}",
+                "IsActive", "ReferenceID", "BriefDescription", "Origin",
+                "CoordinatorFirstName", "CoordinatorLastName"],
+        formula="AND({IsActive}, OR({ProjectID} = '', {ProjectID} = BLANK()))",
     )
 
     not_triaged_refs, stalled_refs, triage_durations = [], [], []
 
     for rec in records:
         f = rec.get("fields", {})
-        status     = (f.get("Status") or "").upper()
-        created_at = _parse_dt(f.get("CreatedAt"))
+        status      = (f.get("Status") or "").upper()
+        created_at  = _parse_dt(f.get("CreatedAt"))
         assigned_at = _parse_dt(f.get("AssignedAt"))
-        ref_id     = f.get("ReferenceID") or ""
-        brief      = f.get("BriefDescription") or ""
-        label      = f"{ref_id} — {brief}" if ref_id and brief else (ref_id or brief or rec["id"])
+        updated_at  = _parse_dt(f.get("UpdatedAt"))
+        ref_id      = f.get("ReferenceID") or ""
+        brief       = f.get("BriefDescription") or ""
+        coord_first = (f.get("CoordinatorFirstName") or "").strip()
+        coord_last  = (f.get("CoordinatorLastName") or "").strip()
+        coord = " ".join(filter(None, [coord_first, coord_last]))
+        label = f"{ref_id} — {brief}" if ref_id and brief else (ref_id or brief or rec["id"])
+        if coord:
+            label += f" [{coord}]"
 
         if status in CLOSED_STATUSES:
             continue
 
-        if status == UNTRIAGED_STATUS and created_at and created_at < cutoff_24h:
-            not_triaged_refs.append(label)
+        # --- wo_not_triaged_24h ---
+        # Clock starts at next business open if submitted after hours
+        if status == UNTRIAGED_STATUS and created_at:
+            biz_start = effective_biz_start(created_at)
+            if biz_start and biz_start < cutoff_24h:
+                not_triaged_refs.append(label)
 
-        if assigned_at and assigned_at < cutoff_72h:
-            stalled_refs.append(label)
+        # --- stalled_wo_72h ---
+        # Last activity (UpdatedAt) business-hours adjusted; catches truly stuck melds
+        last_activity = updated_at or assigned_at or created_at
+        if last_activity:
+            biz_last = effective_biz_start(last_activity)
+            if biz_last and biz_last < cutoff_72h:
+                stalled_refs.append(label)
 
+        # --- time_to_triage (rolling 30d, resident-submitted) ---
         origin = (f.get("Origin") or "").upper()
         is_resident = origin in ("TENANT", "RESIDENT", "")
         if is_resident and created_at and assigned_at and created_at >= cutoff_30d:
-            hours = (assigned_at - created_at).total_seconds() / 3600
-            if 0 <= hours < 720:
-                triage_durations.append(hours)
+            biz_created = effective_biz_start(created_at)
+            if biz_created:
+                hours = (assigned_at - biz_created).total_seconds() / 3600
+                if 0 <= hours < 720:
+                    triage_durations.append(hours)
 
     def _detail(refs):
         if not refs:
@@ -151,22 +211,12 @@ def _maintenance(api_key: str) -> list[MetricSnapshot]:
 # ---------------------------------------------------------------------------
 
 def _execution(api_key: str) -> list[MetricSnapshot]:
+    """Use the Task Due formula field — value is 'Past Due' for overdue tasks."""
     table = Api(api_key).base(BPM_BASE_ID).table("Tasks")
-    today_str = _today().isoformat()
-
-    formula = (
-        f"AND("
-        f"IS_BEFORE({{Target Completion Date}}, '{today_str}'), "
-        f"{{Target Completion Date}} != '', "
-        f"{{Status}} != 'Complete', "
-        f"{{Status}} != 'N/A', "
-        f"{{Status}} != 'Project Cancelled'"
-        f")"
-    )
 
     records = table.all(
-        fields=["Status", "Target Completion Date", "Task Name"],
-        formula=formula,
+        fields=["Task Due", "Task Name"],
+        formula="{Task Due} = 'Past Due'",
     )
 
     return [MetricSnapshot(
@@ -179,7 +229,7 @@ def _execution(api_key: str) -> list[MetricSnapshot]:
 
 
 # ---------------------------------------------------------------------------
-# Missive (live)
+# Missive — individual user unarchived conversation count
 # ---------------------------------------------------------------------------
 
 def _missive() -> list[MetricSnapshot]:
@@ -193,43 +243,78 @@ def _missive() -> list[MetricSnapshot]:
         "Accept": "application/json",
     }
 
-    snapshots = []
-
-    inboxes_over: list[str] = []
     try:
         org_id = _get_org_id(headers)
-        now = datetime.now(timezone.utc)
-        start_ts = int((now - timedelta(hours=24)).timestamp())
-        end_ts = int(now.timestamp())
-
-        reports = _fetch_reports_parallel(headers, org_id, start_ts, end_ts, list(TEAM_INBOXES.items()))
-        for team_name, report in reports.items():
-            sel = report.get("reports", report).get("selected_period", {})
-            metrics = sel.get("global", {}).get("totals", {}).get("metrics", {})
-            inbound = _mv(metrics, "inbound_count") or 0
-            replied = _mv(metrics, "first_reply_count") or 0
-            open_est = max(0, inbound - replied)
-            if open_est > INBOX_THRESHOLD:
-                inboxes_over.append(f"{team_name} (~{open_est} open)")
+        user_counts = _count_unarchived_per_user(headers, org_id)
     except Exception as e:
-        print(f"  [live/missive] inbox check failed: {e}")
+        print(f"  [live/missive] failed: {e}")
+        return [MetricSnapshot(
+            metric="inboxes_over_50",
+            category="Communication Backlog",
+            source="Missive",
+            value=0.0,
+            value_text="None",
+            status="OK",
+        )]
 
-    # Always write inboxes_over_50 — even if all teams failed, record 0
-    count_over = len(inboxes_over)
-    snapshots.append(MetricSnapshot(
+    over = {name: count for name, count in user_counts.items() if count > INBOX_THRESHOLD}
+    count_over = len(over)
+
+    over_lines = [f"{name} ({count} unarchived)" for name, count in
+                  sorted(over.items(), key=lambda x: -x[1])]
+
+    return [MetricSnapshot(
         metric="inboxes_over_50",
         category="Communication Backlog",
         source="Missive",
         value=float(count_over),
-        value_text=", ".join(inboxes_over) if inboxes_over else "None",
-        detail="\n".join(inboxes_over) if inboxes_over else None,
+        value_text=", ".join(name for name in sorted(over, key=lambda n: -over[n])) if over else "None",
+        detail="\n".join(over_lines) if over_lines else None,
         status="Critical" if count_over > 0 else "OK",
-    ))
+    )]
 
-    # oldest_message_age_hours: deferred — Missive conversations endpoint
-    # requires an inbox filter; global listing is not supported by the API.
 
-    return snapshots
+def _count_unarchived_per_user(headers: dict, org_id: str, max_pages: int = 20) -> dict:
+    """
+    Page through unarchived (inbox) conversations and count per user.
+    Returns {user_name: unarchived_count}.
+    Capped at max_pages × 50 conversations.
+    """
+    counts: dict[str, int] = defaultdict(int)
+    params = {"organization": org_id, "inbox": "true", "limit": 50}
+
+    for page in range(max_pages):
+        resp = requests.get(
+            f"{MISSIVE_BASE}/conversations",
+            headers=headers,
+            params=params,
+            timeout=30,
+        )
+        if resp.status_code != 200:
+            print(f"  [live/missive] conversations page {page+1} returned {resp.status_code}")
+            break
+
+        convos = resp.json().get("conversations", [])
+        if not convos:
+            break
+
+        for convo in convos:
+            for user in (convo.get("users") or []):
+                name = user.get("name") or user.get("email", "")
+                if not name or name in SKIP_USER_NAMES:
+                    continue
+                # Only count this conversation for users where it's unarchived
+                if not user.get("archived", True):
+                    counts[name] += 1
+
+        if len(convos) < 50:
+            break
+
+        # Paginate using oldest last_activity_at as cursor
+        oldest_ts = min(c.get("last_activity_at", 0) for c in convos if isinstance(c, dict))
+        params = {"organization": org_id, "inbox": "true", "limit": 50, "until": oldest_ts}
+
+    return dict(counts)
 
 
 # ---------------------------------------------------------------------------
@@ -242,58 +327,50 @@ def _get_org_id(headers):
     return resp.json()["organizations"][0]["id"]
 
 
-def _submit_report(headers, org_id, start_ts, end_ts, team_id) -> str:
-    """Submit a report job and return the report ID. Does NOT wait for completion."""
+def _submit_report(headers, org_id, start_ts, end_ts, filter_key, filter_id) -> str:
     payload = {"reports": {"organization": org_id, "start": start_ts, "end": end_ts,
-                           "time_zone": "America/New_York", "teams": [team_id]}}
+                           "time_zone": "America/New_York", filter_key: [filter_id]}}
     resp = requests.post(f"{MISSIVE_BASE}/analytics/reports", headers=headers, json=payload, timeout=30)
     resp.raise_for_status()
     return resp.json()["reports"]["id"]
 
 
 def _poll_report(headers, report_id, timeout=60) -> dict:
-    """Poll a submitted report until complete."""
     url = f"{MISSIVE_BASE}/analytics/reports/{report_id}"
     deadline = time.time() + timeout
-    time.sleep(3)
+    time.sleep(5)
     while time.time() < deadline:
         r = requests.get(url, headers=headers, timeout=15)
         if r.status_code == 200:
             return r.json()
         if r.status_code not in (202, 404):
             r.raise_for_status()
-        time.sleep(3)
+        time.sleep(5)
     raise TimeoutError(f"Report {report_id} timed out")
 
 
-def _fetch_reports_parallel(headers, org_id, start_ts, end_ts, team_ids_names: list) -> dict:
-    """
-    Submit all reports with a stagger, then poll them all in parallel.
-    Returns {team_name: report_data}.
-    """
-    # Step 1: submit reports one at a time with 1.5s gap to avoid 429
-    submitted = {}  # team_name → report_id
-    for team_id, team_name in team_ids_names:
+def _fetch_reports_parallel(headers, org_id, start_ts, end_ts, items: list,
+                             filter_key: str = "teams") -> dict:
+    """Submit all reports staggered, poll in parallel. Returns {name: report}."""
+    submitted = {}
+    for entity_id, entity_name in items:
         try:
-            report_id = _submit_report(headers, org_id, start_ts, end_ts, team_id)
-            submitted[team_name] = report_id
+            rid = _submit_report(headers, org_id, start_ts, end_ts, filter_key, entity_id)
+            submitted[entity_name] = rid
         except Exception as e:
-            print(f"  [missive] Submit failed for {team_name}: {e}")
+            print(f"  [missive] Submit failed for {entity_name}: {e}")
         time.sleep(1.5)
 
-    # Step 2: poll all submitted reports in parallel
     results = {}
-    with ThreadPoolExecutor(max_workers=len(submitted)) as pool:
-        futures = {
-            pool.submit(_poll_report, headers, report_id): team_name
-            for team_name, report_id in submitted.items()
-        }
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = {pool.submit(_poll_report, headers, rid): name
+                   for name, rid in submitted.items()}
         for future in as_completed(futures):
-            team_name = futures[future]
+            name = futures[future]
             try:
-                results[team_name] = future.result()
+                results[name] = future.result()
             except Exception as e:
-                print(f"  [missive] Poll failed for {team_name}: {e}")
+                print(f"  [missive] Poll failed for {name}: {e}")
 
     return results
 

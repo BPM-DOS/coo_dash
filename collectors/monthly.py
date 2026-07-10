@@ -2,17 +2,17 @@
 collectors/monthly.py
 
 Monthly metrics — written on the 1st of each month.
-period_date = 1st of the current month.
+period_date = 1st of the prior calendar month (the month that just ended).
 
   - owner_churn  : YTD cumulative owners lost, as % of Jan 1 baseline. Target <6%.
-  - uum_growth   : New units added this month (ManagementStartDate in current month),
+  - uum_growth   : New units added in the prior month (ManagementStartDate in prior month),
                    with total active UUM as Secondary Value.
 """
 
 from __future__ import annotations
 
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from pyairtable import Api
 
@@ -29,7 +29,13 @@ def collect(api_key: str) -> list[MetricSnapshot]:
     api = Api(afp_key)
 
     today = _today()
-    month_start = today.replace(day=1)
+    # Prior calendar month: last day = day before the 1st of current month
+    prior_month_end   = today.replace(day=1) - timedelta(days=1)
+    # First day of prior month
+    if today.month == 1:
+        prior_month_start = today.replace(year=today.year - 1, month=12, day=1)
+    else:
+        prior_month_start = today.replace(month=today.month - 1, day=1)
     year_start  = today.replace(month=1, day=1).isoformat()
 
     owners_table = api.base(AFP_BASE_ID).table("Owners (Spine)")
@@ -66,7 +72,7 @@ def collect(api_key: str) -> list[MetricSnapshot]:
             try:
                 from datetime import date as date_type
                 mgmt_date = date_type.fromisoformat(str(d)[:10])
-                if mgmt_date.year == month_start.year and mgmt_date.month == month_start.month:
+                if mgmt_date.year == prior_month_start.year and mgmt_date.month == prior_month_start.month:
                     new_this_month += 1
                     break
             except (ValueError, TypeError):
@@ -88,7 +94,7 @@ def collect(api_key: str) -> list[MetricSnapshot]:
                 f"Remaining allowable at <{CHURN_TARGET}%: {allowable}",
             ]),
             status="Critical" if churn_pct >= CHURN_TARGET else ("Warning" if churn_pct >= CHURN_TARGET * 0.75 else "OK"),
-            period_date=month_start,
+            period_date=prior_month_start,
         ),
         MetricSnapshot(
             metric="uum_growth",
@@ -98,6 +104,6 @@ def collect(api_key: str) -> list[MetricSnapshot]:
             secondary_value=float(total_uum),
             value_text=f"+{new_this_month} new this month ({total_uum} total active)",
             status="OK" if new_this_month > 0 else "Warning",
-            period_date=month_start,
+            period_date=prior_month_start,
         ),
     ]

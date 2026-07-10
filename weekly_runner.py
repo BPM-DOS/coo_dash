@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 load_dotenv(override=True)
 
 from airtable_writer import WeeklyWriter
-from collectors import weekly
+from collectors import weekly, touchpoint
 
 AIRTABLE_API_KEY = os.environ.get("AIRTABLE_API_KEY")
 if not AIRTABLE_API_KEY:
@@ -41,7 +41,8 @@ def main():
     print(f"COO Weekly ETL — {start.isoformat()}")
     print(f"{'='*50}")
 
-    snapshots = run_collector("weekly", weekly.collect, AIRTABLE_API_KEY)
+    snapshots  = run_collector("weekly",     weekly.collect,              AIRTABLE_API_KEY)
+    snapshots += run_collector("touchpoint", touchpoint.collect_weekly,   AIRTABLE_API_KEY)
 
     if snapshots:
         writer = WeeklyWriter(api_key=AIRTABLE_API_KEY)
