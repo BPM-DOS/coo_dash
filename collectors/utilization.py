@@ -20,6 +20,9 @@ import io
 import os
 import time
 from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
+
+ET = ZoneInfo("America/New_York")
 
 import requests
 from pyairtable import Api
@@ -92,7 +95,7 @@ def _brm_utilization(api_key: str) -> MetricSnapshot | None:
         return None
 
     # 4. Determine the work date from delivery timestamp
-    work_date = datetime.fromtimestamp(delivered_ts, tz=timezone.utc).strftime("%Y-%m-%d")
+    work_date = datetime.fromtimestamp(delivered_ts, tz=ET).strftime("%Y-%m-%d")
     print(f"  [utilization] Rippling email found, work_date={work_date}")
 
     # 5. Query AppFolio Work Logs for that date → {tech: estimated_hours}
