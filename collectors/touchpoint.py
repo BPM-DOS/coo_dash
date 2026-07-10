@@ -103,13 +103,17 @@ def _parse_dt(value) -> datetime | None:
         return None
 
 
-def _normalize_category(raw: str) -> str:
-    return raw.lower().replace(" ", "_")
+def _normalize_category(raw) -> str:
+    if isinstance(raw, list):
+        raw = raw[0] if raw else ""
+    if isinstance(raw, dict):
+        raw = raw.get("name", "")
+    return (raw or "").lower().replace(" ", "_")
 
 
 def _is_escalation(f: dict) -> bool:
     """True if this record is an escalation by severity or response type."""
-    cat      = _normalize_category(f.get("Category", {}).get("name", "") if isinstance(f.get("Category"), dict) else f.get("Category") or "")
+    cat      = _normalize_category(f.get("Category") or "")
     severity = (f.get("Severity", {}).get("name", "") if isinstance(f.get("Severity"), dict) else f.get("Severity") or "").strip()
     resp     = {(r.get("name", "") if isinstance(r, dict) else r) for r in (f.get("Response Type") or [])}
     return (
@@ -156,7 +160,7 @@ def collect_live(api_key: str) -> list[MetricSnapshot]:
 
     for rec in records:
         f       = rec.get("fields", {})
-        cat_raw = (f.get("Category", {}).get("name", "") if isinstance(f.get("Category"), dict) else f.get("Category") or "")
+        cat_raw = f.get("Category") or ""
         cat     = _normalize_category(cat_raw)
         status  = (f.get("Status", {}).get("name", "") if isinstance(f.get("Status"), dict) else f.get("Status") or "").strip()
         summary = f.get("Summary") or rec["id"]
@@ -331,7 +335,7 @@ def collect_weekly(api_key: str) -> list[MetricSnapshot]:
 
     for rec in records:
         f       = rec.get("fields", {})
-        cat_raw = (f.get("Category", {}).get("name", "") if isinstance(f.get("Category"), dict) else f.get("Category") or "")
+        cat_raw = f.get("Category") or ""
         cat     = _normalize_category(cat_raw)
         date_str = f.get("Date of Incident") or ""
 
