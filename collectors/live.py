@@ -215,8 +215,15 @@ def _execution(api_key: str) -> list[MetricSnapshot]:
     table = Api(api_key).base(BPM_BASE_ID).table("Tasks")
 
     records = table.all(
-        fields=["Task Due", "Task Name"],
-        formula="{Task Due} = 'Past Due'",
+        fields=["Task Due", "Task Name", "Status"],
+        formula=(
+            "AND("
+            "{Task Due} = 'Past Due', "
+            "{Status} != 'Complete', "
+            "{Status} != 'N/A', "
+            "{Status} != 'Project Cancelled'"
+            ")"
+        ),
     )
 
     return [MetricSnapshot(
