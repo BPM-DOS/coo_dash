@@ -300,6 +300,7 @@ def _fetch_appfolio_hours(api_key: str, work_date: str) -> dict[str, float]:
     records = table.all(
         fields=[FIELD_TECH, FIELD_DATE, FIELD_ALLOC_HRS],
         formula=f"{{fldbkiufmk4CmzEjW}} = '{work_date}'",
+        use_field_ids=True,
     )
 
     totals: dict[str, float] = {}
