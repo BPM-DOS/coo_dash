@@ -302,10 +302,11 @@ def _sla(week_date: date, prior_monday: date, prior_sunday: date) -> list[Metric
     return []
 
 
-def _discover_teams(headers: dict, org_id: str, pages: int = 2) -> dict:
+def _discover_teams(headers: dict, org_id: str, pages: int = 4) -> dict:
     """
     Fetch recent conversations to discover team inbox IDs.
-    Returns {team_id: team_name}, excluding service/bot accounts.
+    The Missive API returns a singular 'team' object (not 'teams' array) on
+    each conversation. Returns {team_id: team_name}, excluding service/bot accounts.
     """
     teams = {}
     params = {"organization": org_id, "all": "true", "limit": 50}
@@ -319,11 +320,13 @@ def _discover_teams(headers: dict, org_id: str, pages: int = 2) -> dict:
         if not convos:
             break
         for c in convos:
-            for t in (c.get("teams") or []):
-                tid  = t.get("id")
-                name = t.get("name") or ""
-                if tid and name and name not in SKIP_USER_NAMES:
-                    teams[tid] = name
+            t = c.get("team")          # singular object, not an array
+            if not t:
+                continue
+            tid  = t.get("id")
+            name = t.get("name") or ""
+            if tid and name and name not in SKIP_USER_NAMES:
+                teams[tid] = name
         if len(convos) < 50:
             break
         oldest_ts = min(c.get("last_activity_at", 0) for c in convos)
