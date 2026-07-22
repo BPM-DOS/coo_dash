@@ -245,9 +245,9 @@ def _sla(week_date: date, prior_monday: date, prior_sunday: date) -> list[Metric
     try:
         org_id = _get_org_id(headers)
 
-        # Discover users from recent conversations
-        users = _discover_users(headers, org_id)
-        if not users:
+        # Discover team inboxes from recent conversations
+        teams = _discover_teams(headers, org_id)
+        if not teams:
             return []
 
         start_ts = int(datetime(prior_monday.year, prior_monday.month, prior_monday.day,
@@ -255,13 +255,13 @@ def _sla(week_date: date, prior_monday: date, prior_sunday: date) -> list[Metric
         end_ts   = int(datetime(prior_sunday.year, prior_sunday.month, prior_sunday.day,
                                 23, 59, 59, tzinfo=timezone.utc).timestamp())
 
-        # Fetch per-user analytics in parallel
+        # Fetch per-team analytics in parallel
         reports = _fetch_reports_parallel(
             headers, org_id, start_ts, end_ts,
-            list(users.items()), filter_key="users"
+            list(teams.items()),  # filter_key defaults to "teams"
         )
 
-        # Compute SLA% per user
+        # Compute SLA% per team
         user_sla: dict[str, float] = {}
         for user_name, report in reports.items():
             sel     = report.get("reports", report).get("selected_period", {})
@@ -302,12 +302,12 @@ def _sla(week_date: date, prior_monday: date, prior_sunday: date) -> list[Metric
     return []
 
 
-def _discover_users(headers: dict, org_id: str, pages: int = 2) -> dict:
+def _discover_teams(headers: dict, org_id: str, pages: int = 2) -> dict:
     """
-    Fetch recent conversations to discover user IDs.
-    Returns {user_id: user_name}, excluding service accounts.
+    Fetch recent conversations to discover team inbox IDs.
+    Returns {team_id: team_name}, excluding service/bot accounts.
     """
-    users = {}
+    teams = {}
     params = {"organization": org_id, "all": "true", "limit": 50}
 
     for _ in range(pages):
@@ -319,17 +319,17 @@ def _discover_users(headers: dict, org_id: str, pages: int = 2) -> dict:
         if not convos:
             break
         for c in convos:
-            for u in (c.get("users") or []):
-                uid  = u.get("id")
-                name = u.get("name") or u.get("email", "")
-                if uid and name and name not in SKIP_USER_NAMES:
-                    users[uid] = name
+            for t in (c.get("teams") or []):
+                tid  = t.get("id")
+                name = t.get("name") or ""
+                if tid and name and name not in SKIP_USER_NAMES:
+                    teams[tid] = name
         if len(convos) < 50:
             break
         oldest_ts = min(c.get("last_activity_at", 0) for c in convos)
         params = {"organization": org_id, "all": "true", "limit": 50, "until": oldest_ts}
 
-    return users
+    return teams
 
 
 # ---------------------------------------------------------------------------
