@@ -23,10 +23,12 @@ from pyairtable import Api
 from airtable_writer import MetricSnapshot, _today
 
 
-AFP_BASE_ID    = os.environ.get("AFP_BASE_ID", "appg8MZ0eQP6CFyfZ")
-MISSIVE_TOKEN  = os.environ.get("MISSIVE_TOKEN", "")
-MISSIVE_BASE   = "https://public.missiveapp.com/v1"
-BRM_TARGET_PCT = 85.0
+AFP_BASE_ID      = os.environ.get("AFP_BASE_ID", "appg8MZ0eQP6CFyfZ")
+LEASING_BASE_ID  = "appAZr2BlFWD11rSQ"   # Leasing Database
+LEASE_UP_TABLE   = "tblGdXesu731CLnBF"   # Lease-Up Cycles
+MISSIVE_TOKEN    = os.environ.get("MISSIVE_TOKEN", "")
+MISSIVE_BASE     = "https://public.missiveapp.com/v1"
+BRM_TARGET_PCT   = 85.0
 
 # Service/bot accounts to exclude from SLA reporting
 SKIP_USER_NAMES = {"BPM-DOS Team", "Reva Nowell", "Evan Mayo", "Jesse Leichtentritt"}
@@ -148,86 +150,53 @@ def _wo_assigned(api_key: str, week_date: date) -> list[MetricSnapshot]:
 
 def _leasing_velocity(api_key: str, week_start: date, week_end: date,
                       week_date: date) -> list[MetricSnapshot]:
+    """
+    Queries Lease-Up Cycles in the Leasing Database.
+    Velocity = Outcome Date − Date Activated for cycles that closed as 'Leased'
+    in the prior week. Renewals do not generate Lease-Up Cycles so no extra
+    exclusion is needed.
+    """
     try:
-        afp_key = os.environ.get("AFP_API_KEY") or api_key
-        airtable = Api(afp_key)
-
-        # Fetch new leases (no renewals) countersigned in the prior week
-        leases = airtable.base(AFP_BASE_ID).table("Leases (Spine)").all(
-            fields=["CountersignedDate", "UnitExternalID", "IsRenewal"],
+        cycles = Api(api_key).base(LEASING_BASE_ID).table(LEASE_UP_TABLE).all(
+            fields=["Date Activated", "Outcome Date", "Outcome"],
             formula=(
                 f"AND("
-                f"IS_AFTER({{CountersignedDate}}, '{(week_start - timedelta(days=1)).isoformat()}'), "
-                f"IS_BEFORE({{CountersignedDate}}, '{(week_end + timedelta(days=1)).isoformat()}'), "
-                f"NOT({{IsRenewal}})"
+                f"IS_AFTER({{Outcome Date}}, '{(week_start - timedelta(days=1)).isoformat()}'), "
+                f"IS_BEFORE({{Outcome Date}}, '{(week_end + timedelta(days=1)).isoformat()}'), "
+                f"{{Outcome}} = 'Leased'"
                 f")"
             ),
         )
 
-        if not leases:
+        cycle_count = len(cycles)
+
+        if not cycles:
             return [MetricSnapshot(
                 metric="leasing_velocity",
                 category="Weekly KPI",
                 source="Airtable",
                 value=0.0,
                 secondary_value=0.0,
-                value_text="0 leases countersigned this week",
+                value_text="0 leases closed this week",
                 status="OK",
                 period_date=week_date,
             )]
 
-        # Map UnitExternalID → CountersignedDate (first encountered wins)
-        unit_countersigned: dict[str, date] = {}
-        for rec in leases:
+        days_list: list[int] = []
+        for rec in cycles:
             f = rec["fields"]
-            uid = (f.get("UnitExternalID") or "").strip()
-            cs_raw = f.get("CountersignedDate") or ""
-            if not uid or not cs_raw:
+            activated_raw = f.get("Date Activated")
+            outcome_raw   = f.get("Outcome Date")
+            if not activated_raw or not outcome_raw:
                 continue
             try:
-                cs_date = date.fromisoformat(cs_raw[:10])
-            except ValueError:
+                activated_date = date.fromisoformat(activated_raw[:10])
+                outcome_date   = date.fromisoformat(outcome_raw[:10])
+                days = (outcome_date - activated_date).days
+                if 0 <= days <= 365:
+                    days_list.append(days)
+            except (ValueError, TypeError):
                 continue
-            if uid not in unit_countersigned:
-                unit_countersigned[uid] = cs_date
-
-        lease_count = len(leases)
-        unit_ids = list(unit_countersigned.keys())
-
-        # Fetch units in chunks of 50 — just match by ExternalID and require AvailableOn.
-        # Do NOT filter by PostedToWebsite/PostedToInternet: those booleans are cleared
-        # after a unit is leased, so filtering on them would return zero results.
-        available_on: dict[str, date] = {}
-        chunk_size = 50
-        for i in range(0, len(unit_ids), chunk_size):
-            chunk = unit_ids[i : i + chunk_size]
-            id_clauses = ", ".join(f"{{ExternalID}}='{uid}'" for uid in chunk)
-            formula = f"OR({id_clauses})" if len(chunk) > 1 else id_clauses
-            units = airtable.base(AFP_BASE_ID).table("Units (Spine)").all(
-                fields=["ExternalID", "AvailableOn"],
-                formula=formula,
-            )
-
-            for rec in units:
-                f = rec["fields"]
-                uid = (f.get("ExternalID") or "").strip()
-                ao_raw = f.get("AvailableOn") or ""
-                if not uid or not ao_raw:
-                    continue
-                try:
-                    available_on[uid] = date.fromisoformat(ao_raw[:10])
-                except ValueError:
-                    continue
-
-        # Compute days-to-lease per unit
-        days_list: list[int] = []
-        for uid, cs_date in unit_countersigned.items():
-            ao = available_on.get(uid)
-            if ao is None:
-                continue
-            days = (cs_date - ao).days
-            if 0 <= days <= 365:
-                days_list.append(days)
 
         if not days_list:
             return [MetricSnapshot(
@@ -235,8 +204,8 @@ def _leasing_velocity(api_key: str, week_start: date, week_end: date,
                 category="Weekly KPI",
                 source="Airtable",
                 value=0.0,
-                secondary_value=float(lease_count),
-                value_text=f"{lease_count} lease(s) countersigned; no eligible units with AvailableOn",
+                secondary_value=float(cycle_count),
+                value_text=f"{cycle_count} lease(s) closed; no Date Activated found",
                 status="Warning",
                 period_date=week_date,
             )]
@@ -248,8 +217,8 @@ def _leasing_velocity(api_key: str, week_start: date, week_end: date,
             category="Weekly KPI",
             source="Airtable",
             value=avg_days,
-            secondary_value=float(lease_count),
-            value_text=f"{avg_days}d avg ({lease_count} lease(s), {len(days_list)} with velocity data)",
+            secondary_value=float(cycle_count),
+            value_text=f"{avg_days}d avg ({cycle_count} lease(s))",
             status=status,
             period_date=week_date,
         )]
