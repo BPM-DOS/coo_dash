@@ -118,7 +118,7 @@ def _maintenance(api_key: str) -> list[MetricSnapshot]:
         fields=["Status", "CreatedAt", "AssignedAt", "UpdatedAt",
                 "IsActive", "ReferenceID", "BriefDescription", "Origin",
                 "CoordinatorFirstName", "CoordinatorLastName"],
-        formula="AND({IsActive}, OR({ProjectID} = '', {ProjectID} = BLANK()), {WorkType} != 'TURN')",
+        formula="AND({IsActive}, OR({ProjectID} = '', {ProjectID} = BLANK()), {WorkCategory} != 'TURNOVER')",
     )
 
     not_triaged_refs, stalled_refs, triage_durations = [], [], []
