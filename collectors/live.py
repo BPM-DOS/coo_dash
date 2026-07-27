@@ -113,12 +113,12 @@ def _maintenance(api_key: str) -> list[MetricSnapshot]:
     cutoff_72h = now - timedelta(hours=72)
     cutoff_30d = now - timedelta(days=30)
 
-    # Exclude project-linked melds
+    # Exclude project-linked melds and turn work orders
     records = table.all(
         fields=["Status", "CreatedAt", "AssignedAt", "UpdatedAt",
                 "IsActive", "ReferenceID", "BriefDescription", "Origin",
                 "CoordinatorFirstName", "CoordinatorLastName"],
-        formula="AND({IsActive}, OR({ProjectID} = '', {ProjectID} = BLANK()))",
+        formula="AND({IsActive}, OR({ProjectID} = '', {ProjectID} = BLANK()), {WorkType} != 'TURN')",
     )
 
     not_triaged_refs, stalled_refs, triage_durations = [], [], []
