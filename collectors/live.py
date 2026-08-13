@@ -13,7 +13,7 @@ Pulls from: Melds (Spine), Tasks, Missive.
     - past_due_tasks        : Tasks where Task Due = "Past Due"
 
   Communication:
-    - inboxes_over_50       : Individual staff members with > 50 unarchived conversations
+    - inboxes_over_50       : Individual staff members with > 50 open conversations (incl. team inbox assigned/unassigned)
 """
 
 from __future__ import annotations
@@ -252,7 +252,7 @@ def _missive() -> list[MetricSnapshot]:
 
     try:
         org_id = _get_org_id(headers)
-        user_counts = _count_unarchived_per_user(headers, org_id)
+        user_counts = _count_open_per_user(headers, org_id)
     except Exception as e:
         print(f"  [live/missive] failed: {e}")
         return [MetricSnapshot(
@@ -267,7 +267,7 @@ def _missive() -> list[MetricSnapshot]:
     over = {name: count for name, count in user_counts.items() if count > INBOX_THRESHOLD}
     count_over = len(over)
 
-    over_lines = [f"{name} ({count} unarchived)" for name, count in
+    over_lines = [f"{name} ({count} open)" for name, count in
                   sorted(over.items(), key=lambda x: -x[1])]
 
     return [MetricSnapshot(
@@ -281,14 +281,19 @@ def _missive() -> list[MetricSnapshot]:
     )]
 
 
-def _count_unarchived_per_user(headers: dict, org_id: str, max_pages: int = 20) -> dict:
+def _count_open_per_user(headers: dict, org_id: str, max_pages: int = 100) -> dict:
     """
-    Page through unarchived (inbox) conversations and count per user.
-    Returns {user_name: unarchived_count}.
-    Capped at max_pages × 50 conversations.
+    Page through ALL conversations and count open ones per user.
+    Uses all=true so team inbox conversations (including 'assigned to others')
+    are captured — inbox=true only showed the token user's personal inbox.
+    A conversation is open for a user if not closed, trashed, or junked.
+    Stops paginating once conversations older than 90 days are reached.
+    Returns {user_name: open_count}.
     """
+    cutoff_ts = int(time.time()) - 90 * 86400
+
     counts: dict[str, int] = defaultdict(int)
-    params = {"organization": org_id, "inbox": "true", "limit": 50}
+    params = {"organization": org_id, "all": "true", "limit": 50}
 
     for page in range(max_pages):
         resp = requests.get(
@@ -310,16 +315,20 @@ def _count_unarchived_per_user(headers: dict, org_id: str, max_pages: int = 20) 
                 name = user.get("name") or user.get("email", "")
                 if not name or name in SKIP_USER_NAMES:
                     continue
-                # Only count this conversation for users where it's unarchived
-                if not user.get("archived", True):
+                # Open = not closed, not trashed, not junked
+                if (not user.get("closed") and
+                        not user.get("trashed") and
+                        not user.get("junked")):
                     counts[name] += 1
 
         if len(convos) < 50:
             break
 
-        # Paginate using oldest last_activity_at as cursor
         oldest_ts = min(c.get("last_activity_at", 0) for c in convos if isinstance(c, dict))
-        params = {"organization": org_id, "inbox": "true", "limit": 50, "until": oldest_ts}
+        if oldest_ts and oldest_ts < cutoff_ts:
+            break
+
+        params = {"organization": org_id, "all": "true", "limit": 50, "until": oldest_ts}
 
     return dict(counts)
 
