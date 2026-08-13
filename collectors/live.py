@@ -236,7 +236,7 @@ def _execution(api_key: str) -> list[MetricSnapshot]:
 
 
 # ---------------------------------------------------------------------------
-# Missive — individual user unarchived conversation count
+# Missive — shared team inbox conversation counts
 # ---------------------------------------------------------------------------
 
 def _missive() -> list[MetricSnapshot]:
@@ -252,7 +252,20 @@ def _missive() -> list[MetricSnapshot]:
 
     try:
         org_id = _get_org_id(headers)
-        user_counts = _count_open_per_user(headers, org_id)
+        teams = _discover_teams_live(headers, org_id)
+        print(f"  [live/missive] discovered {len(teams)} team inboxes: {list(teams.values())}")
+
+        inbox_counts = {}
+        for team_id, team_name in teams.items():
+            assigned, unassigned = _count_team_inbox(headers, team_id)
+            inbox_counts[team_name] = {
+                "assigned": assigned,
+                "unassigned": unassigned,
+                "total": assigned + unassigned,
+            }
+            print(f"  [live/missive] {team_name}: {assigned + unassigned} total "
+                  f"({assigned} assigned, {unassigned} unassigned)")
+
     except Exception as e:
         print(f"  [live/missive] failed: {e}")
         return [MetricSnapshot(
@@ -264,142 +277,93 @@ def _missive() -> list[MetricSnapshot]:
             status="OK",
         )]
 
-    # user_counts is now {name: {"assigned": N, "labeled": M, "total": N+M}}
-    over = {name: data["total"] for name, data in user_counts.items() if data["total"] > INBOX_THRESHOLD}
+    # Inboxes over threshold trigger the alert
+    over = {name: data for name, data in inbox_counts.items()
+            if data["total"] > INBOX_THRESHOLD}
     count_over = len(over)
 
-    # Pipe-delimited detail for structured frontend rendering: Name|total|assigned|labeled
-    detail_lines = []
-    for name, total in sorted(over.items(), key=lambda x: -x[1]):
-        a = user_counts[name]["assigned"]
-        l = user_counts[name]["labeled"]
-        detail_lines.append(f"{name}|{total}|{a}|{l}")
+    # Detail includes ALL inboxes sorted by total (for full picture in modal)
+    detail_lines = [
+        f"{name}|{data['total']}|{data['assigned']}|{data['unassigned']}"
+        for name, data in sorted(inbox_counts.items(), key=lambda x: -x[1]["total"])
+    ]
 
     return [MetricSnapshot(
         metric="inboxes_over_50",
         category="Communication Backlog",
         source="Missive",
         value=float(count_over),
-        value_text=", ".join(name for name in sorted(over, key=lambda n: -over[n])) if over else "None",
+        value_text=", ".join(
+            name for name in sorted(over, key=lambda n: -over[n]["total"])
+        ) if over else "None",
         detail="\n".join(detail_lines) if detail_lines else None,
         status="Critical" if count_over > 0 else "OK",
     )]
 
 
-def _fetch_at_labels(headers: dict, org_id: str) -> dict:
+def _discover_teams_live(headers: dict, org_id: str, pages: int = 4) -> dict:
     """
-    Fetch all org labels and return {label_id: shortname} for @-prefixed ones.
-    e.g. {"abc123": "joe"} for a label named "@joe".
+    Discover shared team inbox IDs from recent conversations.
+    Returns {team_id: team_name}.
     """
-    resp = requests.get(
-        f"{MISSIVE_BASE}/labels",
-        headers=headers,
-        params={"organization": org_id},
-        timeout=15,
-    )
-    if resp.status_code != 200:
-        print(f"  [live/missive] labels fetch returned {resp.status_code}")
-        return {}
-    return {
-        l["id"]: l["name"][1:].lower()
-        for l in resp.json().get("labels", [])
-        if (l.get("name") or "").startswith("@")
-    }
-
-
-def _count_open_per_user(headers: dict, org_id: str, max_pages: int = 100) -> dict:
-    """
-    Page through ALL conversations and count open ones per user.
-    Counts: (1) conversations explicitly assigned to them, plus
-            (2) conversations carrying their personal @label (e.g. @joe).
-    Deduped — a conversation that is both assigned and @labeled counts once.
-    Stops paginating once conversations older than 90 days are reached.
-    Returns {user_name: {"assigned": N, "labeled": M, "total": N+M}}.
-    """
-    at_labels = _fetch_at_labels(headers, org_id)
-    print(f"  [live/missive] @-labels found: {list(at_labels.values()) or 'none'}")
-
-    cutoff_ts = int(time.time()) - 90 * 86400
-
-    # Use sets of convo IDs to deduplicate across assigned and labeled
-    assigned_ids: dict[str, set] = defaultdict(set)
-    labeled_ids: dict[str, set] = defaultdict(set)
-
-    # first_name (lowercase) → full user name, built as we discover users
-    first_to_name: dict[str, str] = {}
-
+    teams = {}
     params = {"organization": org_id, "all": "true", "limit": 50}
-
-    for page in range(max_pages):
-        resp = requests.get(
-            f"{MISSIVE_BASE}/conversations",
-            headers=headers,
-            params=params,
-            timeout=30,
-        )
+    for _ in range(pages):
+        resp = requests.get(f"{MISSIVE_BASE}/conversations", headers=headers,
+                            params=params, timeout=30)
         if resp.status_code != 200:
-            print(f"  [live/missive] conversations page {page+1} returned {resp.status_code}")
             break
+        convos = resp.json().get("conversations", [])
+        if not convos:
+            break
+        for c in convos:
+            t = c.get("team")
+            if not t:
+                continue
+            tid  = t.get("id")
+            name = t.get("name") or ""
+            if tid and name and name not in SKIP_USER_NAMES:
+                teams[tid] = name
+        if len(convos) < 50:
+            break
+        oldest_ts = min(c.get("last_activity_at", 0) for c in convos if isinstance(c, dict))
+        params = {"organization": org_id, "all": "true", "limit": 50, "until": oldest_ts}
+    return teams
 
+
+def _count_team_inbox(headers: dict, team_id: str, max_pages: int = 20) -> tuple[int, int]:
+    """
+    Count open conversations in a shared team inbox, split by assigned vs unassigned.
+    Uses team_inbox={id} which returns the inbox view (open, non-closed conversations).
+    A conversation is "assigned" if at least one user has assigned=true on it.
+    Returns (assigned_count, unassigned_count).
+    """
+    assigned = 0
+    unassigned = 0
+    params = {"team_inbox": team_id, "limit": 50}
+
+    for _ in range(max_pages):
+        resp = requests.get(f"{MISSIVE_BASE}/conversations", headers=headers,
+                            params=params, timeout=30)
+        if resp.status_code != 200:
+            break
         convos = resp.json().get("conversations", [])
         if not convos:
             break
 
         for convo in convos:
-            convo_id = convo.get("id")
-            convo_label_ids = {l["id"] for l in (convo.get("labels") or [])}
-
-            # Register user names on this conversation first so @label matching
-            # on the same conversation can find them immediately.
-            for user in (convo.get("users") or []):
-                name = user.get("name") or user.get("email", "")
-                if name and name not in SKIP_USER_NAMES:
-                    first = name.split()[0].lower()
-                    first_to_name.setdefault(first, name)
-
-            # Count assigned conversations
-            for user in (convo.get("users") or []):
-                name = user.get("name") or user.get("email", "")
-                if not name or name in SKIP_USER_NAMES:
-                    continue
-                if not user.get("closed") and not user.get("trashed") and not user.get("junked"):
-                    if user.get("assigned"):
-                        assigned_ids[name].add(convo_id)
-
-            # Count @labeled conversations
-            if at_labels and convo_label_ids:
-                for label_id, shortname in at_labels.items():
-                    if label_id not in convo_label_ids:
-                        continue
-                    # Match shortname to a known user by first name prefix
-                    matched = None
-                    for first, uname in first_to_name.items():
-                        if first.startswith(shortname) or shortname.startswith(first):
-                            matched = uname
-                            break
-                    if matched:
-                        labeled_ids[matched].add(convo_id)
+            is_assigned = any(u.get("assigned") for u in (convo.get("users") or []))
+            if is_assigned:
+                assigned += 1
+            else:
+                unassigned += 1
 
         if len(convos) < 50:
             break
-
         oldest_ts = min(c.get("last_activity_at", 0) for c in convos if isinstance(c, dict))
-        if oldest_ts and oldest_ts < cutoff_ts:
-            break
+        params = {"team_inbox": team_id, "limit": 50, "until": oldest_ts}
 
-        params = {"organization": org_id, "all": "true", "limit": 50, "until": oldest_ts}
-
-    # Build results: labeled = conversations with @label NOT already in assigned
-    result = {}
-    for name in set(assigned_ids) | set(labeled_ids):
-        a = assigned_ids.get(name, set())
-        l = labeled_ids.get(name, set()) - a  # exclude already-assigned
-        result[name] = {
-            "assigned": len(a),
-            "labeled": len(l),
-            "total": len(a) + len(l),
-        }
-    return result
+    return assigned, unassigned
 
 
 # ---------------------------------------------------------------------------
