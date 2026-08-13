@@ -264,11 +264,17 @@ def _missive() -> list[MetricSnapshot]:
             status="OK",
         )]
 
-    over = {name: count for name, count in user_counts.items() if count > INBOX_THRESHOLD}
+    # user_counts is now {name: {"assigned": N, "unassigned": M}}
+    user_totals = {name: data["assigned"] + data["unassigned"] for name, data in user_counts.items()}
+    over = {name: total for name, total in user_totals.items() if total > INBOX_THRESHOLD}
     count_over = len(over)
 
-    over_lines = [f"{name} ({count} open)" for name, count in
-                  sorted(over.items(), key=lambda x: -x[1])]
+    # Pipe-delimited detail for structured frontend rendering: Name|total|assigned|unassigned
+    detail_lines = []
+    for name, total in sorted(over.items(), key=lambda x: -x[1]):
+        a = user_counts[name]["assigned"]
+        u = user_counts[name]["unassigned"]
+        detail_lines.append(f"{name}|{total}|{a}|{u}")
 
     return [MetricSnapshot(
         metric="inboxes_over_50",
@@ -276,23 +282,21 @@ def _missive() -> list[MetricSnapshot]:
         source="Missive",
         value=float(count_over),
         value_text=", ".join(name for name in sorted(over, key=lambda n: -over[n])) if over else "None",
-        detail="\n".join(over_lines) if over_lines else None,
+        detail="\n".join(detail_lines) if detail_lines else None,
         status="Critical" if count_over > 0 else "OK",
     )]
 
 
 def _count_open_per_user(headers: dict, org_id: str, max_pages: int = 100) -> dict:
     """
-    Page through ALL conversations and count open ones per user.
-    Uses all=true so team inbox conversations (including 'assigned to others')
-    are captured — inbox=true only showed the token user's personal inbox.
-    A conversation is open for a user if not closed, trashed, or junked.
+    Page through ALL conversations and count open ones per user, split by assigned vs unassigned.
+    Uses all=true so team inbox conversations are captured.
     Stops paginating once conversations older than 90 days are reached.
-    Returns {user_name: open_count}.
+    Returns {user_name: {"assigned": N, "unassigned": M}}.
     """
     cutoff_ts = int(time.time()) - 90 * 86400
 
-    counts: dict[str, int] = defaultdict(int)
+    counts: dict[str, dict] = defaultdict(lambda: {"assigned": 0, "unassigned": 0})
     params = {"organization": org_id, "all": "true", "limit": 50}
 
     for page in range(max_pages):
@@ -315,14 +319,11 @@ def _count_open_per_user(headers: dict, org_id: str, max_pages: int = 100) -> di
                 name = user.get("name") or user.get("email", "")
                 if not name or name in SKIP_USER_NAMES:
                     continue
-                # Count only if this person needs to act on it:
-                # assigned to them OR in their unassigned inbox pile (team inbox).
-                # Excludes watchers/org-members who are just bystanders.
-                if (user.get("assigned") or user.get("unassigned")) and \
-                        not user.get("closed") and \
-                        not user.get("trashed") and \
-                        not user.get("junked"):
-                    counts[name] += 1
+                if not user.get("closed") and not user.get("trashed") and not user.get("junked"):
+                    if user.get("assigned"):
+                        counts[name]["assigned"] += 1
+                    elif user.get("unassigned"):
+                        counts[name]["unassigned"] += 1
 
         if len(convos) < 50:
             break
