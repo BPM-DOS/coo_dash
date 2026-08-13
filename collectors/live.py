@@ -49,8 +49,8 @@ UNTRIAGED_STATUS = "PENDING_ASSIGNMENT"
 CLOSED_STATUSES  = {"COMPLETED", "MANAGER_CANCELED", "TENANT_CANCELED", "CANCELLED", "CANCELED"}
 DETAIL_CAP = 50
 
-# Service/bot accounts to exclude from individual inbox counts
-SKIP_USER_NAMES = {"BPM-DOS Team"}
+# Service/bot accounts and former staff to exclude from individual inbox counts
+SKIP_USER_NAMES = {"BPM-DOS Team", "Marchenka White", "Jeff Stoddard"}
 
 
 def collect(api_key: str) -> list[MetricSnapshot]:
@@ -264,17 +264,16 @@ def _missive() -> list[MetricSnapshot]:
             status="OK",
         )]
 
-    # user_counts is now {name: {"assigned": N, "unassigned": M}}
-    user_totals = {name: data["assigned"] + data["unassigned"] for name, data in user_counts.items()}
-    over = {name: total for name, total in user_totals.items() if total > INBOX_THRESHOLD}
+    # user_counts is now {name: {"assigned": N, "labeled": M, "total": N+M}}
+    over = {name: data["total"] for name, data in user_counts.items() if data["total"] > INBOX_THRESHOLD}
     count_over = len(over)
 
-    # Pipe-delimited detail for structured frontend rendering: Name|total|assigned|unassigned
+    # Pipe-delimited detail for structured frontend rendering: Name|total|assigned|labeled
     detail_lines = []
     for name, total in sorted(over.items(), key=lambda x: -x[1]):
         a = user_counts[name]["assigned"]
-        u = user_counts[name]["unassigned"]
-        detail_lines.append(f"{name}|{total}|{a}|{u}")
+        l = user_counts[name]["labeled"]
+        detail_lines.append(f"{name}|{total}|{a}|{l}")
 
     return [MetricSnapshot(
         metric="inboxes_over_50",
@@ -287,16 +286,48 @@ def _missive() -> list[MetricSnapshot]:
     )]
 
 
+def _fetch_at_labels(headers: dict, org_id: str) -> dict:
+    """
+    Fetch all org labels and return {label_id: shortname} for @-prefixed ones.
+    e.g. {"abc123": "joe"} for a label named "@joe".
+    """
+    resp = requests.get(
+        f"{MISSIVE_BASE}/labels",
+        headers=headers,
+        params={"organization": org_id},
+        timeout=15,
+    )
+    if resp.status_code != 200:
+        print(f"  [live/missive] labels fetch returned {resp.status_code}")
+        return {}
+    return {
+        l["id"]: l["name"][1:].lower()
+        for l in resp.json().get("labels", [])
+        if (l.get("name") or "").startswith("@")
+    }
+
+
 def _count_open_per_user(headers: dict, org_id: str, max_pages: int = 100) -> dict:
     """
-    Page through ALL conversations and count open ones per user, split by assigned vs unassigned.
-    Uses all=true so team inbox conversations are captured.
+    Page through ALL conversations and count open ones per user.
+    Counts: (1) conversations explicitly assigned to them, plus
+            (2) conversations carrying their personal @label (e.g. @joe).
+    Deduped — a conversation that is both assigned and @labeled counts once.
     Stops paginating once conversations older than 90 days are reached.
-    Returns {user_name: {"assigned": N, "unassigned": M}}.
+    Returns {user_name: {"assigned": N, "labeled": M, "total": N+M}}.
     """
+    at_labels = _fetch_at_labels(headers, org_id)
+    print(f"  [live/missive] @-labels found: {list(at_labels.values()) or 'none'}")
+
     cutoff_ts = int(time.time()) - 90 * 86400
 
-    counts: dict[str, dict] = defaultdict(lambda: {"assigned": 0, "unassigned": 0})
+    # Use sets of convo IDs to deduplicate across assigned and labeled
+    assigned_ids: dict[str, set] = defaultdict(set)
+    labeled_ids: dict[str, set] = defaultdict(set)
+
+    # first_name (lowercase) → full user name, built as we discover users
+    first_to_name: dict[str, str] = {}
+
     params = {"organization": org_id, "all": "true", "limit": 50}
 
     for page in range(max_pages):
@@ -315,15 +346,39 @@ def _count_open_per_user(headers: dict, org_id: str, max_pages: int = 100) -> di
             break
 
         for convo in convos:
+            convo_id = convo.get("id")
+            convo_label_ids = {l["id"] for l in (convo.get("labels") or [])}
+
+            # Register user names on this conversation first so @label matching
+            # on the same conversation can find them immediately.
+            for user in (convo.get("users") or []):
+                name = user.get("name") or user.get("email", "")
+                if name and name not in SKIP_USER_NAMES:
+                    first = name.split()[0].lower()
+                    first_to_name.setdefault(first, name)
+
+            # Count assigned conversations
             for user in (convo.get("users") or []):
                 name = user.get("name") or user.get("email", "")
                 if not name or name in SKIP_USER_NAMES:
                     continue
                 if not user.get("closed") and not user.get("trashed") and not user.get("junked"):
                     if user.get("assigned"):
-                        counts[name]["assigned"] += 1
-                    elif user.get("unassigned"):
-                        counts[name]["unassigned"] += 1
+                        assigned_ids[name].add(convo_id)
+
+            # Count @labeled conversations
+            if at_labels and convo_label_ids:
+                for label_id, shortname in at_labels.items():
+                    if label_id not in convo_label_ids:
+                        continue
+                    # Match shortname to a known user by first name prefix
+                    matched = None
+                    for first, uname in first_to_name.items():
+                        if first.startswith(shortname) or shortname.startswith(first):
+                            matched = uname
+                            break
+                    if matched:
+                        labeled_ids[matched].add(convo_id)
 
         if len(convos) < 50:
             break
@@ -334,7 +389,17 @@ def _count_open_per_user(headers: dict, org_id: str, max_pages: int = 100) -> di
 
         params = {"organization": org_id, "all": "true", "limit": 50, "until": oldest_ts}
 
-    return dict(counts)
+    # Build results: labeled = conversations with @label NOT already in assigned
+    result = {}
+    for name in set(assigned_ids) | set(labeled_ids):
+        a = assigned_ids.get(name, set())
+        l = labeled_ids.get(name, set()) - a  # exclude already-assigned
+        result[name] = {
+            "assigned": len(a),
+            "labeled": len(l),
+            "total": len(a) + len(l),
+        }
+    return result
 
 
 # ---------------------------------------------------------------------------
