@@ -315,10 +315,13 @@ def _count_open_per_user(headers: dict, org_id: str, max_pages: int = 100) -> di
                 name = user.get("name") or user.get("email", "")
                 if not name or name in SKIP_USER_NAMES:
                     continue
-                # Open = not closed, not trashed, not junked
-                if (not user.get("closed") and
-                        not user.get("trashed") and
-                        not user.get("junked")):
+                # Count only if this person needs to act on it:
+                # assigned to them OR in their unassigned inbox pile (team inbox).
+                # Excludes watchers/org-members who are just bystanders.
+                if (user.get("assigned") or user.get("unassigned")) and \
+                        not user.get("closed") and \
+                        not user.get("trashed") and \
+                        not user.get("junked"):
                     counts[name] += 1
 
         if len(convos) < 50:
