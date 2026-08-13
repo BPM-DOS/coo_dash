@@ -47,10 +47,12 @@ for page in range(4):
 print(f"Found {len(teams)} team inboxes: {list(teams.values())}\n")
 
 # --- count each inbox ---
+CUTOFF_TS = int(time.time()) - 90 * 86400
+
 def count_team_inbox(team_id):
     assigned = 0
     unassigned = 0
-    p = {"team_inbox": team_id, "limit": 50}
+    p = {"team_all": team_id, "limit": 50}
     for _ in range(20):
         r = requests.get(f"{MISSIVE_BASE}/conversations", headers=headers, params=p, timeout=30)
         if r.status_code != 200:
@@ -60,15 +62,17 @@ def count_team_inbox(team_id):
         if not convos:
             break
         for convo in convos:
-            is_assigned = any(u.get("assigned") for u in (convo.get("users") or []))
-            if is_assigned:
+            users = convo.get("users") or []
+            if any(u.get("assigned") for u in users):
                 assigned += 1
-            else:
+            elif any(u.get("unassigned") for u in users):
                 unassigned += 1
         if len(convos) < 50:
             break
         oldest_ts = min(c.get("last_activity_at", 0) for c in convos if isinstance(c, dict))
-        p = {"team_inbox": team_id, "limit": 50, "until": oldest_ts}
+        if oldest_ts and oldest_ts < CUTOFF_TS:
+            break
+        p = {"team_all": team_id, "limit": 50, "until": oldest_ts}
     return assigned, unassigned
 
 results = []

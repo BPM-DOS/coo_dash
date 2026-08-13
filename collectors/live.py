@@ -331,16 +331,20 @@ def _discover_teams_live(headers: dict, org_id: str, pages: int = 4) -> dict:
     return teams
 
 
-def _count_team_inbox(headers: dict, team_id: str, max_pages: int = 20) -> tuple[int, int]:
+def _count_team_inbox(headers: dict, team_id: str,
+                      max_pages: int = 20, cutoff_days: int = 90) -> tuple[int, int]:
     """
-    Count open conversations in a shared team inbox, split by assigned vs unassigned.
-    Uses team_inbox={id} which returns the inbox view (open, non-closed conversations).
-    A conversation is "assigned" if at least one user has assigned=true on it.
+    Count active conversations for a team inbox, split by assigned vs unassigned.
+    Uses team_all={id} so assigned conversations (which leave the team_inbox view
+    when claimed) are included alongside unassigned ones.
+    A conversation is active if any user has assigned=true or unassigned=true.
+    Stops once conversations older than cutoff_days are reached.
     Returns (assigned_count, unassigned_count).
     """
+    cutoff_ts = int(time.time()) - cutoff_days * 86400
     assigned = 0
     unassigned = 0
-    params = {"team_inbox": team_id, "limit": 50}
+    params = {"team_all": team_id, "limit": 50}
 
     for _ in range(max_pages):
         resp = requests.get(f"{MISSIVE_BASE}/conversations", headers=headers,
@@ -352,16 +356,21 @@ def _count_team_inbox(headers: dict, team_id: str, max_pages: int = 20) -> tuple
             break
 
         for convo in convos:
-            is_assigned = any(u.get("assigned") for u in (convo.get("users") or []))
-            if is_assigned:
+            users = convo.get("users") or []
+            has_assigned   = any(u.get("assigned")   for u in users)
+            has_unassigned = any(u.get("unassigned") for u in users)
+            if has_assigned:
                 assigned += 1
-            else:
+            elif has_unassigned:
                 unassigned += 1
+            # else: closed/done, skip
 
         if len(convos) < 50:
             break
         oldest_ts = min(c.get("last_activity_at", 0) for c in convos if isinstance(c, dict))
-        params = {"team_inbox": team_id, "limit": 50, "until": oldest_ts}
+        if oldest_ts and oldest_ts < cutoff_ts:
+            break
+        params = {"team_all": team_id, "limit": 50, "until": oldest_ts}
 
     return assigned, unassigned
 
