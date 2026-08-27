@@ -56,6 +56,7 @@ def collect(api_key: str) -> list[MetricSnapshot]:
 
 def _brm_utilization(api_key: str, week_start_str: str, week_date: date,
                      week_end_str: str) -> list[MetricSnapshot]:
+    week_end_date = date.fromisoformat(week_end_str)
     try:
         afp_key = os.environ.get("AFP_API_KEY") or api_key
         logs = Api(afp_key).base(AFP_BASE_ID).table("Work Logs").all(
@@ -96,6 +97,7 @@ def _brm_utilization(api_key: str, week_start_str: str, week_date: date,
                 detail="\n".join(detail_lines),
                 status=_util_status(pct),
                 period_date=week_date,
+                period_end=week_end_date,
             )]
         else:
             return [MetricSnapshot(
@@ -108,6 +110,7 @@ def _brm_utilization(api_key: str, week_start_str: str, week_date: date,
                 detail="\n".join(detail_lines),
                 status="Warning",
                 period_date=week_date,
+                period_end=week_end_date,
             )]
     except Exception as e:
         print(f"  [weekly] brm_utilization failed: {e}")
@@ -180,6 +183,7 @@ def _leasing_velocity(api_key: str, week_start: date, week_end: date,
                 value_text="0 leases closed this week",
                 status="OK",
                 period_date=week_date,
+                period_end=week_end,
             )]
 
         days_list: list[int] = []
@@ -208,6 +212,7 @@ def _leasing_velocity(api_key: str, week_start: date, week_end: date,
                 value_text=f"{cycle_count} lease(s) closed; no Date Activated found",
                 status="Warning",
                 period_date=week_date,
+                period_end=week_end,
             )]
 
         avg_days = round(sum(days_list) / len(days_list), 1)
@@ -221,6 +226,7 @@ def _leasing_velocity(api_key: str, week_start: date, week_end: date,
             value_text=f"{avg_days}d avg ({cycle_count} lease(s))",
             status=status,
             period_date=week_date,
+            period_end=week_end,
         )]
 
     except Exception as e:
@@ -295,6 +301,7 @@ def _sla(week_date: date, prior_monday: date, prior_sunday: date) -> list[Metric
             detail="Bottom 3 SLA%:\n" + "\n".join(detail_lines),
             status="OK" if overall >= 95 else ("Warning" if overall >= 80 else "Critical"),
             period_date=week_date,
+            period_end=prior_sunday,
         )]
 
     except Exception as e:
@@ -349,6 +356,8 @@ def _submit_report(headers, org_id, start_ts, end_ts, filter_key, filter_id) -> 
     payload = {"reports": {"organization": org_id, "start": start_ts, "end": end_ts,
                            "time_zone": "America/New_York", filter_key: [filter_id]}}
     r = requests.post(f"{MISSIVE_BASE}/analytics/reports", headers=headers, json=payload, timeout=30)
+    if not r.ok:
+        print(f"  [missive/analytics] 400 body: {r.text[:500]}")
     r.raise_for_status()
     return r.json()["reports"]["id"]
 

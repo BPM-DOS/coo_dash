@@ -48,7 +48,7 @@ try:
 except ImportError:
     from backports.zoneinfo import ZoneInfo
 
-from airtable_writer import MetricSnapshot, _today
+from airtable_writer import MetricSnapshot
 
 
 BPM_BASE_ID = os.environ.get("BPM_BASE_ID", "apprp203tCiyHl6Dw")
@@ -314,8 +314,14 @@ def collect_weekly(api_key: str) -> list[MetricSnapshot]:
     now       = datetime.now(timezone.utc)
     cutoff_7  = (now - timedelta(days=7)).strftime("%Y-%m-%d")
     cutoff_90 = (now - timedelta(days=90)).strftime("%Y-%m-%d")
-    today_date = _today()
-    week_date  = today_date  # period anchor for weekly snapshot
+    # Anchor Data From/Data To to the same prior Mon-Sun window as
+    # collectors/weekly.py, so this metric lines up with the other 4 weekly
+    # KPIs from the same run regardless of which day the script executes.
+    # (The 7d/90d lookbacks used for flagging below are separate from this
+    # display window.)
+    days_since_monday = now.weekday()
+    week_date = (now - timedelta(days=days_since_monday + 7)).date()
+    week_end  = week_date + timedelta(days=6)
 
     # Fetch all TT records from last 90 days
     tt_table = Api(bpm_key).base(BPM_BASE_ID).table(TT_TABLE)
@@ -379,6 +385,7 @@ def collect_weekly(api_key: str) -> list[MetricSnapshot]:
         detail="\n".join(detail_lines[:DETAIL_CAP]) if detail_lines else None,
         status=_threshold(len(flagged), warn=1, critical=3),
         period_date=week_date,
+        period_end=week_end,
     )]
 
 

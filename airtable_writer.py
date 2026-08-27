@@ -4,7 +4,7 @@ airtable_writer.py
 Three write modes matching the three COO Dashboard tables:
 
   LiveWriter    — COO Live Metrics   : upserts by Metric only (overwrites in place, no date key)
-  WeeklyWriter  — COO Weekly Metrics : upserts by Metric + Week Of
+  WeeklyWriter  — COO Weekly Metrics : upserts by Metric + Data From (Data To marks period end)
   MonthlyWriter — COO Monthly Metrics: upserts by Metric + Month
 """
 
@@ -40,6 +40,7 @@ class MetricSnapshot:
         detail: str | None = None,
         target: float | None = None,
         period_date: date | None = None,   # week start or month start
+        period_end: date | None = None,    # week table only: end of the reporting period (Data To)
     ):
         self.metric         = metric
         self.category       = category
@@ -51,6 +52,7 @@ class MetricSnapshot:
         self.detail         = detail
         self.target         = target
         self.period_date    = period_date or _today()
+        self.period_end     = period_end or self.period_date
 
     def _base_fields(self) -> dict[str, Any]:
         now_str = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
@@ -72,11 +74,12 @@ class MetricSnapshot:
         return {"Record ID": self.metric, **self._base_fields()}
 
     def to_weekly_fields(self) -> dict[str, Any]:
-        """Weekly table: keyed on metric-YYYY-MM-DD (Monday of the week)."""
+        """Weekly table: keyed on metric-YYYY-MM-DD (start of the reporting period)."""
         record_id = f"{self.metric}-{self.period_date.isoformat()}"
         return {
             "Record ID": record_id,
-            "Week Of":   self.period_date.isoformat(),
+            "Data From": self.period_date.isoformat(),
+            "Data To":   self.period_end.isoformat(),
             **self._base_fields(),
         }
 
