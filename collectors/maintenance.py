@@ -3,7 +3,8 @@ collectors/maintenance.py
 
 Metrics from Melds (Spine) in the Appfolio Database:
   - wo_not_triaged_24h   : Melds still in PENDING_ASSIGNMENT > 24h, with ReferenceID drill-down
-  - stalled_wo_72h       : Melds assigned but not completed within 72h, with ReferenceID drill-down
+  - stalled_wo_72h       : Melds assigned 72h+ ago with no chat activity in that window,
+                           excluding turn melds (ProjectID set, or MICR/MOCR in name)
   - time_to_triage_hours : Avg hours from CreatedAt → AssignedAt (rolling 30d, resident-submitted)
 """
 
@@ -48,7 +49,8 @@ def collect(api_key: str) -> list[MetricSnapshot]:
 
     records = table.all(
         fields=["Status", "CreatedAt", "AssignedAt", "UpdatedAt", "IsActive",
-                "ReferenceID", "BriefDescription", "Origin"],
+                "ReferenceID", "BriefDescription", "Origin",
+                "LastActivityAt", "LastActivityType", "ProjectID"],
         formula="{IsActive}",
     )
 
@@ -62,9 +64,15 @@ def collect(api_key: str) -> list[MetricSnapshot]:
         created_at = _parse_dt(f.get("CreatedAt"))
         assigned_at = _parse_dt(f.get("AssignedAt"))
         updated_at = _parse_dt(f.get("UpdatedAt"))
+        last_activity_at = _parse_dt(f.get("LastActivityAt"))
         ref_id = f.get("ReferenceID") or ""
         brief = f.get("BriefDescription") or ""
+        project_id = f.get("ProjectID") or ""
         label = f"{ref_id} — {brief}" if ref_id and brief else (ref_id or brief or rec["id"])
+
+        # Turn melds: part of a project, or name contains MICR/MOCR (turn project naming issues)
+        brief_upper = brief.upper()
+        is_turn = bool(project_id) or "MICR" in brief_upper or "MOCR" in brief_upper
 
         if status in CLOSED_STATUSES:
             continue
@@ -75,9 +83,14 @@ def collect(api_key: str) -> list[MetricSnapshot]:
             not_triaged_refs.append(label)
 
         # --- stalled_wo_72h ---
-        # Has been assigned (AssignedAt exists) but not closed, and AssignedAt > 72h ago.
-        # This catches anything stuck after assignment regardless of current status.
-        if assigned_at and assigned_at < cutoff_72h:
+        # Assigned 72h+ ago, no chat activity in that window, and not a turn meld.
+        # LastActivityAt (newest chat message timestamp) is the authoritative signal for
+        # "someone actually touched this." UpdatedAt is intentionally NOT used here because
+        # PropertyMeld bumps it on server-side events (cache stamps, denorm recalcs) that
+        # are invisible to users.
+        if (not is_turn
+                and assigned_at and assigned_at < cutoff_72h
+                and (last_activity_at is None or last_activity_at < cutoff_72h)):
             stalled_refs.append(label)
 
         # --- time_to_triage (rolling 30d, resident-submitted only) ---
