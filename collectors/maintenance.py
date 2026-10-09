@@ -5,7 +5,11 @@ Metrics from Melds (Spine) in the Appfolio Database:
   - wo_not_triaged_24h   : Melds still in PENDING_ASSIGNMENT > 24h, with ReferenceID drill-down
   - stalled_wo_72h       : Melds assigned 72h+ ago with no chat activity in that window,
                            excluding turn melds (ProjectID set, or MICR/MOCR in name)
+                           and excluding CapEx-tagged melds (those go to capex_* instead)
   - time_to_triage_hours : Avg hours from CreatedAt → AssignedAt (rolling 30d, resident-submitted)
+  - capex_0_14d          : CapEx melds assigned 0–14 days ago (new / recently started)
+  - capex_14_28d         : CapEx melds assigned 14–28 days ago (getting old)
+  - capex_28d_plus       : CapEx melds assigned 28+ days ago (aged / needs attention)
 """
 
 from __future__ import annotations
@@ -50,12 +54,18 @@ def collect(api_key: str) -> list[MetricSnapshot]:
     records = table.all(
         fields=["Status", "CreatedAt", "AssignedAt", "UpdatedAt", "IsActive",
                 "ReferenceID", "BriefDescription", "Origin",
-                "LastActivityAt", "LastActivityType", "ProjectID"],
+                "LastActivityAt", "LastActivityType", "ProjectID", "WorkType", "Tags"],
         formula="{IsActive}",
     )
 
+    cutoff_14d = now - timedelta(days=14)
+    cutoff_28d = now - timedelta(days=28)
+
     not_triaged_refs: list[str] = []
     stalled_refs: list[str] = []
+    capex_0_14_refs: list[str] = []
+    capex_14_28_refs: list[str] = []
+    capex_28_plus_refs: list[str] = []
     triage_durations: list[float] = []
 
     for rec in records:
@@ -74,6 +84,14 @@ def collect(api_key: str) -> list[MetricSnapshot]:
         brief_upper = brief.upper()
         is_turn = bool(project_id) or "MICR" in brief_upper or "MOCR" in brief_upper
 
+        # CapEx melds: tagged with "CapEx" in the Tags multi-select field.
+        # These are excluded from stalled_wo_72h and tracked in their own aging buckets.
+        tags = f.get("Tags") or []
+        is_capex = any(
+            (t or "").strip().lower() == "capex"
+            for t in (tags if isinstance(tags, list) else [tags])
+        )
+
         if status in CLOSED_STATUSES:
             continue
 
@@ -83,15 +101,26 @@ def collect(api_key: str) -> list[MetricSnapshot]:
             not_triaged_refs.append(label)
 
         # --- stalled_wo_72h ---
-        # Assigned 72h+ ago, no chat activity in that window, and not a turn meld.
+        # Assigned 72h+ ago, no chat activity in that window, not a turn meld, and not CapEx.
         # LastActivityAt (newest chat message timestamp) is the authoritative signal for
         # "someone actually touched this." UpdatedAt is intentionally NOT used here because
         # PropertyMeld bumps it on server-side events (cache stamps, denorm recalcs) that
         # are invisible to users.
-        if (not is_turn
+        if (not is_turn and not is_capex
                 and assigned_at and assigned_at < cutoff_72h
                 and (last_activity_at is None or last_activity_at < cutoff_72h)):
             stalled_refs.append(label)
+
+        # --- capex aging buckets ---
+        # CapEx melds are tracked by how long ago they were assigned, regardless of activity.
+        # Buckets: 0–14d (new), 14–28d (aging), 28d+ (aged).
+        if is_capex and assigned_at:
+            if assigned_at >= cutoff_14d:
+                capex_0_14_refs.append(label)
+            elif assigned_at >= cutoff_28d:
+                capex_14_28_refs.append(label)
+            else:
+                capex_28_plus_refs.append(label)
 
         # --- time_to_triage (rolling 30d, resident-submitted only) ---
         origin = (f.get("Origin") or "").upper()
@@ -129,6 +158,31 @@ def collect(api_key: str) -> list[MetricSnapshot]:
             value=float(len(stalled_refs)),
             detail=_detail(stalled_refs),
             status=_threshold(len(stalled_refs), warn=5, critical=15),
+        ),
+        # CapEx Aging — three time buckets
+        MetricSnapshot(
+            metric="capex_0_14d",
+            category="CapEx Aging",
+            source="Airtable",
+            value=float(len(capex_0_14_refs)),
+            detail=_detail(capex_0_14_refs),
+            status="OK",
+        ),
+        MetricSnapshot(
+            metric="capex_14_28d",
+            category="CapEx Aging",
+            source="Airtable",
+            value=float(len(capex_14_28_refs)),
+            detail=_detail(capex_14_28_refs),
+            status=_threshold(len(capex_14_28_refs), warn=1, critical=5),
+        ),
+        MetricSnapshot(
+            metric="capex_28d_plus",
+            category="CapEx Aging",
+            source="Airtable",
+            value=float(len(capex_28_plus_refs)),
+            detail=_detail(capex_28_plus_refs),
+            status=_threshold(len(capex_28_plus_refs), warn=1, critical=3),
         ),
     ]
 
