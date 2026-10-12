@@ -86,10 +86,12 @@ def collect(api_key: str) -> list[MetricSnapshot]:
 
         # CapEx melds: tagged with "CapEx" in the Tags multi-select field.
         # These are excluded from stalled_wo_72h and tracked in their own aging buckets.
-        tags = f.get("Tags") or []
+        # pyairtable returns multipleSelects as plain strings; guard against dict format too.
+        tags_raw = f.get("Tags") or []
+        tags_list = tags_raw if isinstance(tags_raw, list) else [tags_raw]
         is_capex = any(
-            (t or "").strip().lower() == "capex"
-            for t in (tags if isinstance(tags, list) else [tags])
+            (t.get("name", "") if isinstance(t, dict) else str(t or "")).strip().lower() == "capex"
+            for t in tags_list
         )
 
         if status in CLOSED_STATUSES:
@@ -194,7 +196,7 @@ def collect(api_key: str) -> list[MetricSnapshot]:
                 source="Airtable",
                 value=avg_triage_hours,
                 secondary_value=float(len(triage_durations)),
-                status=_threshold(avg_triage_hours, warn=12, critical=24),
+                status=_threshold(avg_triage_hours, warn=30, critical=45),
             )
         )
 
