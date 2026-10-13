@@ -117,11 +117,16 @@ def _maintenance(api_key: str) -> list[MetricSnapshot]:
     records = table.all(
         fields=["Status", "CreatedAt", "AssignedAt", "UpdatedAt",
                 "IsActive", "ReferenceID", "BriefDescription", "Origin",
-                "CoordinatorFirstName", "CoordinatorLastName"],
-        formula="AND({IsActive}, OR({ProjectID} = '', {ProjectID} = BLANK()), {WorkCategory} != 'TURNOVER')",
+                "CoordinatorFirstName", "CoordinatorLastName",
+                "LastActivityAt", "ProjectID", "Tags"],
+        formula="{IsActive}",
     )
 
     not_triaged_refs, stalled_refs, triage_durations = [], [], []
+    capex_0_14_refs, capex_14_28_refs, capex_28_plus_refs = [], [], []
+
+    cutoff_14d = now - timedelta(days=14)
+    cutoff_28d = now - timedelta(days=28)
 
     for rec in records:
         f = rec.get("fields", {})
@@ -129,14 +134,28 @@ def _maintenance(api_key: str) -> list[MetricSnapshot]:
         created_at  = _parse_dt(f.get("CreatedAt"))
         assigned_at = _parse_dt(f.get("AssignedAt"))
         updated_at  = _parse_dt(f.get("UpdatedAt"))
+        last_activity_at = _parse_dt(f.get("LastActivityAt"))
         ref_id      = f.get("ReferenceID") or ""
         brief       = f.get("BriefDescription") or ""
+        project_id  = f.get("ProjectID") or ""
         coord_first = (f.get("CoordinatorFirstName") or "").strip()
         coord_last  = (f.get("CoordinatorLastName") or "").strip()
         coord = " ".join(filter(None, [coord_first, coord_last]))
         label = f"{ref_id} — {brief}" if ref_id and brief else (ref_id or brief or rec["id"])
         if coord:
             label += f" [{coord}]"
+
+        # Turn melds: part of a project, or MICR/MOCR in brief
+        brief_upper = brief.upper()
+        is_turn = bool(project_id) or "MICR" in brief_upper or "MOCR" in brief_upper
+
+        # CapEx melds: tagged with "CapEx" in the Tags multi-select field.
+        tags_raw = f.get("Tags") or []
+        tags_list = tags_raw if isinstance(tags_raw, list) else [tags_raw]
+        is_capex = any(
+            (t.get("name", "") if isinstance(t, dict) else str(t or "")).strip().lower() == "capex"
+            for t in tags_list
+        )
 
         if status in CLOSED_STATUSES:
             continue
@@ -149,12 +168,22 @@ def _maintenance(api_key: str) -> list[MetricSnapshot]:
                 not_triaged_refs.append(label)
 
         # --- stalled_wo_72h ---
-        # Last activity (UpdatedAt) business-hours adjusted; catches truly stuck melds
-        last_activity = updated_at or assigned_at or created_at
-        if last_activity:
-            biz_last = effective_biz_start(last_activity)
+        # Excludes turn melds and CapEx melds (those go to capex_* buckets).
+        # Uses LastActivityAt as the authoritative activity signal.
+        if not is_turn and not is_capex and assigned_at and assigned_at < cutoff_72h:
+            activity = last_activity_at or updated_at or assigned_at
+            biz_last = effective_biz_start(activity)
             if biz_last and biz_last < cutoff_72h:
                 stalled_refs.append(label)
+
+        # --- capex aging buckets ---
+        if is_capex and assigned_at:
+            if assigned_at >= cutoff_14d:
+                capex_0_14_refs.append(label)
+            elif assigned_at >= cutoff_28d:
+                capex_14_28_refs.append(label)
+            else:
+                capex_28_plus_refs.append(label)
 
         # --- time_to_triage (rolling 30d, resident-submitted) ---
         origin = (f.get("Origin") or "").upper()
@@ -190,6 +219,30 @@ def _maintenance(api_key: str) -> list[MetricSnapshot]:
             detail=_detail(stalled_refs),
             status=_threshold(len(stalled_refs), warn=5, critical=15),
         ),
+        MetricSnapshot(
+            metric="capex_0_14d",
+            category="CapEx Aging",
+            source="Airtable",
+            value=float(len(capex_0_14_refs)),
+            detail=_detail(capex_0_14_refs),
+            status="OK",
+        ),
+        MetricSnapshot(
+            metric="capex_14_28d",
+            category="CapEx Aging",
+            source="Airtable",
+            value=float(len(capex_14_28_refs)),
+            detail=_detail(capex_14_28_refs),
+            status=_threshold(len(capex_14_28_refs), warn=1, critical=5),
+        ),
+        MetricSnapshot(
+            metric="capex_28d_plus",
+            category="CapEx Aging",
+            source="Airtable",
+            value=float(len(capex_28_plus_refs)),
+            detail=_detail(capex_28_plus_refs),
+            status=_threshold(len(capex_28_plus_refs), warn=1, critical=3),
+        ),
     ]
 
     if triage_durations:
@@ -200,7 +253,7 @@ def _maintenance(api_key: str) -> list[MetricSnapshot]:
             source="Airtable",
             value=avg,
             secondary_value=float(len(triage_durations)),
-            status=_threshold(avg, warn=12, critical=24),
+            status=_threshold(avg, warn=30, critical=45),
         ))
 
     return snapshots
