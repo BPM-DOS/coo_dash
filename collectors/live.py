@@ -123,10 +123,10 @@ def _maintenance(api_key: str) -> list[MetricSnapshot]:
     )
 
     not_triaged_refs, stalled_refs, triage_durations = [], [], []
-    capex_0_14_refs, capex_14_28_refs, capex_28_plus_refs = [], [], []
+    capex_0_30_refs, capex_30_45_refs, capex_45_plus_refs = [], [], []
 
-    cutoff_14d = now - timedelta(days=14)
-    cutoff_28d = now - timedelta(days=28)
+    cutoff_30d_aging = now - timedelta(days=30)
+    cutoff_45d = now - timedelta(days=45)
 
     for rec in records:
         f = rec.get("fields", {})
@@ -176,14 +176,14 @@ def _maintenance(api_key: str) -> list[MetricSnapshot]:
             if biz_last and biz_last < cutoff_72h:
                 stalled_refs.append(label)
 
-        # --- capex aging buckets ---
+        # --- capex aging buckets (0-30d healthy, 30-45d warning, 45d+ critical) ---
         if is_capex and assigned_at:
-            if assigned_at >= cutoff_14d:
-                capex_0_14_refs.append(label)
-            elif assigned_at >= cutoff_28d:
-                capex_14_28_refs.append(label)
+            if assigned_at >= cutoff_30d_aging:
+                capex_0_30_refs.append(label)
+            elif assigned_at >= cutoff_45d:
+                capex_30_45_refs.append(label)
             else:
-                capex_28_plus_refs.append(label)
+                capex_45_plus_refs.append(label)
 
         # --- time_to_triage (rolling 30d, resident-submitted) ---
         origin = (f.get("Origin") or "").upper()
@@ -220,28 +220,28 @@ def _maintenance(api_key: str) -> list[MetricSnapshot]:
             status=_threshold(len(stalled_refs), warn=5, critical=15),
         ),
         MetricSnapshot(
-            metric="capex_0_14d",
+            metric="capex_0_30d",
             category="CapEx Aging",
             source="Airtable",
-            value=float(len(capex_0_14_refs)),
-            detail=_detail(capex_0_14_refs),
+            value=float(len(capex_0_30_refs)),
+            detail=_detail(capex_0_30_refs),
             status="OK",
         ),
         MetricSnapshot(
-            metric="capex_14_28d",
+            metric="capex_30_45d",
             category="CapEx Aging",
             source="Airtable",
-            value=float(len(capex_14_28_refs)),
-            detail=_detail(capex_14_28_refs),
-            status=_threshold(len(capex_14_28_refs), warn=1, critical=5),
+            value=float(len(capex_30_45_refs)),
+            detail=_detail(capex_30_45_refs),
+            status=_threshold(len(capex_30_45_refs), warn=1, critical=5),
         ),
         MetricSnapshot(
-            metric="capex_28d_plus",
+            metric="capex_45d_plus",
             category="CapEx Aging",
             source="Airtable",
-            value=float(len(capex_28_plus_refs)),
-            detail=_detail(capex_28_plus_refs),
-            status=_threshold(len(capex_28_plus_refs), warn=1, critical=3),
+            value=float(len(capex_45_plus_refs)),
+            detail=_detail(capex_45_plus_refs),
+            status=_threshold(len(capex_45_plus_refs), warn=1, critical=3),
         ),
     ]
 
