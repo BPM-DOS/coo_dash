@@ -49,6 +49,14 @@ UNTRIAGED_STATUS = "PENDING_ASSIGNMENT"
 CLOSED_STATUSES  = {"COMPLETED", "MANAGER_CANCELED", "TENANT_CANCELED", "CANCELLED", "CANCELED"}
 DETAIL_CAP = 50
 
+# Estimate statuses that justify a meld being untriaged — exclude from wo_not_triaged_24h
+ESTIMATE_PENDING_STATUSES = {
+    "ESTIMATE_PENDING_ACCEPTANCE",
+    "ESTIMATE_PENDING_APPROVAL",
+    "ESTIMATE_IN_PROGRESS",
+    "ESTIMATE_SUBMITTED",
+}
+
 # Service/bot accounts and former staff to exclude from individual inbox counts
 SKIP_USER_NAMES = {"BPM-DOS Team", "Marchenka White", "Jeff Stoddard"}
 
@@ -118,7 +126,8 @@ def _maintenance(api_key: str) -> list[MetricSnapshot]:
         fields=["Status", "CreatedAt", "AssignedAt", "UpdatedAt",
                 "IsActive", "ReferenceID", "BriefDescription", "Origin",
                 "CoordinatorFirstName", "CoordinatorLastName",
-                "LastActivityAt", "ProjectID", "Tags"],
+                "LastActivityAt", "ProjectID", "Tags",
+                "EstimateStatus (from Meld Estimates)"],
         formula="{IsActive}",
     )
 
@@ -161,11 +170,20 @@ def _maintenance(api_key: str) -> list[MetricSnapshot]:
             continue
 
         # --- wo_not_triaged_24h ---
-        # Clock starts at next business open if submitted after hours
+        # Clock starts at next business open if submitted after hours.
+        # Exclude melds where an estimate is actively pending (legitimately untriaged).
         if status == UNTRIAGED_STATUS and created_at:
-            biz_start = effective_biz_start(created_at)
-            if biz_start and biz_start < cutoff_24h:
-                not_triaged_refs.append(label)
+            est_statuses_raw = f.get("EstimateStatus (from Meld Estimates)") or []
+            if not isinstance(est_statuses_raw, list):
+                est_statuses_raw = [est_statuses_raw]
+            has_pending_estimate = any(
+                (s or "").upper() in ESTIMATE_PENDING_STATUSES
+                for s in est_statuses_raw
+            )
+            if not has_pending_estimate:
+                biz_start = effective_biz_start(created_at)
+                if biz_start and biz_start < cutoff_24h:
+                    not_triaged_refs.append(label)
 
         # --- stalled_wo_72h ---
         # Excludes turn melds and CapEx melds (those go to capex_* buckets).
