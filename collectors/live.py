@@ -58,7 +58,7 @@ ESTIMATE_PENDING_STATUSES = {
 }
 
 # Service/bot accounts and former staff to exclude from individual inbox counts
-SKIP_USER_NAMES = {"BPM-DOS Team", "Marchenka White", "Jeff Stoddard"}
+SKIP_USER_NAMES = {"BPM-DOS Team", "Marchenka White", "Jeff Stoddard", "Emily Clay"}
 
 
 def collect(api_key: str) -> list[MetricSnapshot]:
@@ -406,15 +406,16 @@ def _count_team_inbox(headers: dict, team_id: str,
                       max_pages: int = 20, cutoff_days: int = 90) -> tuple[int, int]:
     """
     Count open conversations for a team inbox, split by assigned vs unassigned.
-    Uses team={id} (inbox view only) so archived/closed conversations are excluded.
-    This matches what users see when they open the team inbox in Missive.
+    Uses team_all={id} to capture both assigned and unassigned conversations,
+    then filters to only open ones by checking for closed_at / archived_at.
     Stops once conversations older than cutoff_days are reached.
     Returns (assigned_count, unassigned_count).
     """
     cutoff_ts = int(time.time()) - cutoff_days * 86400
     assigned = 0
     unassigned = 0
-    params = {"team": team_id, "limit": 50}
+    _debug_logged = False  # log one raw conversation per team to verify state fields
+    params = {"team_all": team_id, "limit": 50}
 
     for _ in range(max_pages):
         resp = requests.get(f"{MISSIVE_BASE}/conversations", headers=headers,
@@ -426,6 +427,19 @@ def _count_team_inbox(headers: dict, team_id: str,
             break
 
         for convo in convos:
+            # Log raw keys of first conversation so we can see what state fields exist
+            if not _debug_logged:
+                state_fields = {k: convo.get(k) for k in convo if "clos" in k.lower()
+                                or "archiv" in k.lower() or "state" in k.lower()
+                                or "open" in k.lower() or "status" in k.lower()}
+                print(f"  [live/missive/debug] sample convo keys: {list(convo.keys())}")
+                print(f"  [live/missive/debug] state-related fields: {state_fields}")
+                _debug_logged = True
+
+            # Skip archived/closed conversations — Missive uses closed_at or archived_at
+            if convo.get("closed_at") or convo.get("archived_at"):
+                continue
+
             users = convo.get("users") or []
             has_assigned   = any(u.get("assigned")   for u in users)
             has_unassigned = any(u.get("unassigned") for u in users)
@@ -433,7 +447,6 @@ def _count_team_inbox(headers: dict, team_id: str,
                 assigned += 1
             elif has_unassigned:
                 unassigned += 1
-            # else: closed/done, skip
 
         if len(convos) < 50:
             break
