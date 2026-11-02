@@ -405,17 +405,16 @@ def _discover_teams_live(headers: dict, org_id: str, pages: int = 4) -> dict:
 def _count_team_inbox(headers: dict, team_id: str,
                       max_pages: int = 20, cutoff_days: int = 90) -> tuple[int, int]:
     """
-    Count active conversations for a team inbox, split by assigned vs unassigned.
-    Uses team_all={id} so assigned conversations (which leave the team_inbox view
-    when claimed) are included alongside unassigned ones.
-    A conversation is active if any user has assigned=true or unassigned=true.
+    Count open conversations for a team inbox, split by assigned vs unassigned.
+    Uses team={id} (inbox view only) so archived/closed conversations are excluded.
+    This matches what users see when they open the team inbox in Missive.
     Stops once conversations older than cutoff_days are reached.
     Returns (assigned_count, unassigned_count).
     """
     cutoff_ts = int(time.time()) - cutoff_days * 86400
     assigned = 0
     unassigned = 0
-    params = {"team_all": team_id, "limit": 50}
+    params = {"team": team_id, "limit": 50}
 
     for _ in range(max_pages):
         resp = requests.get(f"{MISSIVE_BASE}/conversations", headers=headers,
