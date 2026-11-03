@@ -50,6 +50,9 @@ job alive and finishing?", the emails answer "did anything go wrong?".
 
 Environment
 -----------
+    RESEND_API_KEY       send through Resend's HTTPS API (port 443). Preferred on
+                         DigitalOcean, which blocks outbound SMTP ports 25/465/587.
+                         When set, the SMTP_* settings are ignored.
     SMTP_HOST, SMTP_PORT (587), SMTP_USERNAME, SMTP_PASSWORD
     SMTP_USE_SSL (false), SMTP_USE_TLS (true unless SSL)
     ALERT_EMAIL_FROM     falls back to FAILURE_EMAIL_FROM, then SMTP_USERNAME
@@ -75,11 +78,12 @@ import sys
 import threading
 import time
 import traceback
+import urllib.error
 import urllib.request
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 
-ALERTS_VERSION = "2026-11-03"
+ALERTS_VERSION = "2026-11-03.2"
 DEFAULT_TO = "bpm-dos@bradenproperty.com"
 SUBJECT_FAILED = "[ETL FAILED]"
 SUBJECT_RECOVERED = "[ETL RECOVERED]"
@@ -534,11 +538,17 @@ class RunMonitor:
         recipients = [a.strip() for a in (_env("ALERT_EMAIL_TO") or _env("FAILURE_EMAIL_TO") or DEFAULT_TO).split(",") if a.strip()]
         sender = _env("ALERT_EMAIL_FROM") or _env("FAILURE_EMAIL_FROM") or _env("SMTP_USERNAME")
         host = _env("SMTP_HOST")
+        api_key = _env("RESEND_API_KEY")
         if self.dry_run:
             self._log(f"[dry-run] email to {', '.join(recipients)}\nSubject: {subject}\n\n{body}\n[dry-run] end of email")
             return True
+        if api_key:
+            if not sender:
+                self._log(f"EMAIL NOT SENT (ALERT_EMAIL_FROM not set): {subject}")
+                return False
+            return self._send_resend(api_key, sender, recipients, subject, body)
         if not host or not sender:
-            self._log(f"EMAIL NOT SENT (SMTP_HOST / ALERT_EMAIL_FROM not set): {subject}")
+            self._log(f"EMAIL NOT SENT (RESEND_API_KEY or SMTP_HOST, and ALERT_EMAIL_FROM, not set): {subject}")
             return False
         msg = EmailMessage()
         msg["From"] = sender
@@ -565,7 +575,41 @@ class RunMonitor:
             except Exception as e:
                 last = e
                 time.sleep(3)
-        self._log(f"EMAIL FAILED ({type(last).__name__}: {last}); subject was: {subject}")
+        hint = ""
+        if isinstance(last, (TimeoutError, ConnectionError)) and not isinstance(last, smtplib.SMTPException) \
+                and port in (25, 465, 587):
+            hint = " - outbound SMTP may be blocked by the host (DigitalOcean blocks 25/465/587); use RESEND_API_KEY"
+        self._log(f"EMAIL FAILED ({type(last).__name__}: {last}){hint}; subject was: {subject}")
+        return False
+
+    def _send_resend(self, api_key, sender, recipients, subject, body):
+        """Send through Resend's HTTPS API, which works where SMTP ports are blocked."""
+        url = _env("RESEND_API_URL", "https://api.resend.com/emails")
+        payload = json.dumps({"from": sender, "to": recipients, "subject": subject, "text": body}).encode("utf-8")
+        last = None
+        for attempt in range(2):
+            try:
+                req = urllib.request.Request(url, data=payload, method="POST", headers={
+                    "Authorization": f"Bearer {api_key}",
+                    "Content-Type": "application/json",
+                    "User-Agent": f"bpm-dos-alerts/{ALERTS_VERSION}",
+                })
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    resp.read()
+                self._log(f"emailed {', '.join(recipients)} via Resend API: {subject}")
+                return True
+            except urllib.error.HTTPError as e:
+                try:
+                    detail = e.read().decode("utf-8", "replace")[:300]
+                except Exception:
+                    detail = ""
+                last = f"HTTP {e.code} {detail}".strip()
+                if e.code < 500 and e.code != 429:
+                    break  # bad key / unverified sender: retrying won't help
+            except Exception as e:
+                last = f"{type(e).__name__}: {e}"
+            time.sleep(3)
+        self._log(f"EMAIL FAILED via Resend API ({last}); subject was: {subject}")
         return False
 
 
@@ -589,7 +633,12 @@ def start(job, heartbeat_env=None, state_dir=None, runbook=None, capture_output=
         email_note, beat_note = "off (ALERTS_DISABLED)", "off (ALERTS_DISABLED)"
     else:
         to = _env("ALERT_EMAIL_TO") or _env("FAILURE_EMAIL_TO") or DEFAULT_TO
-        email_note = (f"to {to}" if _env("SMTP_HOST") else "NOT CONFIGURED (SMTP_HOST unset)")
+        if _env("RESEND_API_KEY"):
+            email_note = f"to {to} via Resend API"
+        elif _env("SMTP_HOST"):
+            email_note = f"to {to} via SMTP {_env('SMTP_HOST')}:{_env('SMTP_PORT', '587')}"
+        else:
+            email_note = "NOT CONFIGURED (RESEND_API_KEY / SMTP_HOST unset)"
         beat_note = "on" if monitor.heartbeat_url else f"off ({heartbeat_env or 'no env var'} not set)"
         if monitor.dry_run:
             email_note += " [dry-run]"
