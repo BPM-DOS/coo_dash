@@ -24,6 +24,24 @@ from pyairtable import Api
 
 load_dotenv(override=True)
 
+# Error emails to bpm-dos@ + dead man's switch heartbeat (alerts.py lives in the
+# repo root, one level up). Started before the config below so a missing env
+# var is reported too.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, _REPO_ROOT)
+import alerts  # noqa: E402
+monitor = alerts.start(
+    "Rippling hours sync",
+    heartbeat_env="RIPPLING_HEARTBEAT_URL",
+    state_dir=_REPO_ROOT,
+    runbook=(
+        "Logs:  ssh root@104.131.181.174  then  tail -n 300 /var/log/rippling_sync.log\n"
+        "Code:  BPM-DOS/coo_dash scripts/rippling_sync.py - finds the weekly Rippling email in Missive "
+        "and writes Worked Hours to the Scorecard\n"
+        "Alerting setup: see the docstring at the top of alerts.py"
+    ),
+)
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -220,7 +238,8 @@ def main():
     if not convo:
         print(f"ERROR: No Rippling email found matching '{RIPPLING_SUBJECT_CONTAINS}' in last 7 days.")
         print("Check RIPPLING_SUBJECT_CONTAINS in .env — should match part of the email subject.")
-        sys.exit(1)
+        alerts.error("Rippling email", f"no Rippling email matching '{RIPPLING_SUBJECT_CONTAINS}' in Missive in the last 7 days - Worked Hours not updated")
+        sys.exit(monitor.finish())
 
     print(f"Found conversation: '{convo.get('subject')}' (id: {convo['id']})")
 
@@ -228,14 +247,16 @@ def main():
     csv_text = get_csv_attachment(convo["id"])
     if not csv_text:
         print("ERROR: No CSV attachment found in conversation.")
-        sys.exit(1)
+        alerts.error("Rippling email", "the Rippling email has no CSV attachment - Worked Hours not updated")
+        sys.exit(monitor.finish())
 
     print(f"Parsing CSV ({len(csv_text)} bytes)...")
     rows = parse_rippling_csv(csv_text)
     if not rows:
         print("ERROR: CSV parsed but no valid rows found. Check column names.")
         print("Expected columns: 'Employee', 'Time entry payable time (hours)', 'Pay period start'")
-        sys.exit(1)
+        alerts.error("Rippling CSV", "CSV parsed but no valid rows - check the column names - Worked Hours not updated")
+        sys.exit(monitor.finish())
 
     print(f"Found {len(rows)} row(s):")
     for r in rows:
@@ -244,7 +265,8 @@ def main():
     print("Writing to Airtable...")
     result = upsert_to_scorecard(rows)
     print(f"Done: {result['created']} created, {result['updated']} updated.")
+    return monitor.finish()
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

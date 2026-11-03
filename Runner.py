@@ -9,11 +9,26 @@ Cron:
 """
 
 import os
+import sys
 import traceback
 from datetime import datetime, timezone
 
 from dotenv import load_dotenv
 load_dotenv(override=True)
+
+# Error emails to bpm-dos@ + dead man's switch heartbeat. Started before the
+# other imports so even an import error is reported. See alerts.py.
+import alerts
+monitor = alerts.start(
+    "COO Dash live metrics",
+    heartbeat_env="COO_LIVE_HEARTBEAT_URL",
+    state_dir=os.path.dirname(os.path.abspath(__file__)),
+    runbook=(
+        "Logs:  ssh root@104.131.181.174  then  tail -n 300 /var/log/coo_live.log\n"
+        "Code:  BPM-DOS/coo_dash (/root/coo_dash on the VM) - Runner.py runs collectors/live.py, touchpoint.py, utilization.py\n"
+        "Alerting setup: see the docstring at the top of alerts.py"
+    ),
+)
 
 from airtable_writer import LiveWriter
 from collectors import live, touchpoint, utilization
@@ -31,6 +46,7 @@ def run_collector(name, fn, *args):
     except Exception as exc:
         print(f"  [{name}] ERROR: {exc}")
         traceback.print_exc()
+        alerts.error(name, "collector failed - its metrics were not updated this run", exc=exc)
         return []
 
 
@@ -51,7 +67,8 @@ def main():
 
     elapsed = (datetime.now(timezone.utc) - start).total_seconds()
     print(f"Done in {elapsed:.1f}s")
+    return monitor.finish()
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())

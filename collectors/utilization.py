@@ -28,6 +28,7 @@ import requests
 from pyairtable import Api
 
 from airtable_writer import MetricSnapshot
+import alerts
 
 
 # ── Airtable ───────────────────────────────────────────────────────────────────
@@ -86,6 +87,7 @@ def _brm_utilization(api_key: str) -> MetricSnapshot | None:
         raw_csv, delivered_ts = _fetch_csv_attachment(token, convo["id"])
     except Exception as e:
         print(f"  [utilization] Could not fetch CSV: {e}")
+        alerts.error("utilization", "could not download the Rippling CSV from Missive - brm_utilization_pct skipped", exc=e)
         return None
 
     # 3. Parse Rippling CSV → {tech: actual_hours}
@@ -103,6 +105,7 @@ def _brm_utilization(api_key: str) -> MetricSnapshot | None:
         appfolio_hours = _fetch_appfolio_hours(api_key, work_date)
     except Exception as e:
         print(f"  [utilization] Work Logs query failed: {e}")
+        alerts.error("utilization", "Work Logs query failed - brm_utilization_pct skipped", exc=e)
         return None
 
     # 6. Compute per-tech and overall utilization
@@ -192,6 +195,7 @@ def _write_to_scorecard(api_key: str, work_date: str,
         print(f"  [utilization/scorecard] {len(to_create)} created, {len(to_update)} updated → Util_Rate_Daily")
     except Exception as e:
         print(f"  [utilization/scorecard] Write failed (non-fatal): {e}")
+        alerts.error("utilization/scorecard", "write to Util_Rate_Daily failed", exc=e)
 
 
 # ── WO Assigned Pct ────────────────────────────────────────────────────────────

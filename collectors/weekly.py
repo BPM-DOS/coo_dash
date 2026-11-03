@@ -21,6 +21,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pyairtable import Api
 
 from airtable_writer import MetricSnapshot, _today
+import alerts
 
 
 AFP_BASE_ID      = os.environ.get("AFP_BASE_ID", "appg8MZ0eQP6CFyfZ")
@@ -114,6 +115,7 @@ def _brm_utilization(api_key: str, week_start_str: str, week_date: date,
             )]
     except Exception as e:
         print(f"  [weekly] brm_utilization failed: {e}")
+        alerts.error("weekly/brm_utilization", "metric not written", exc=e)
     return []
 
 
@@ -144,6 +146,7 @@ def _wo_assigned(api_key: str, week_date: date) -> list[MetricSnapshot]:
             )]
     except Exception as e:
         print(f"  [weekly] wo_assigned failed: {e}")
+        alerts.error("weekly/wo_assigned", "metric not written", exc=e)
     return []
 
 
@@ -231,6 +234,7 @@ def _leasing_velocity(api_key: str, week_start: date, week_end: date,
 
     except Exception as e:
         print(f"  [weekly] leasing_velocity failed: {e}")
+        alerts.error("weekly/leasing_velocity", "metric not written", exc=e)
     return []
 
 
@@ -306,6 +310,7 @@ def _sla(week_date: date, prior_monday: date, prior_sunday: date) -> list[Metric
 
     except Exception as e:
         print(f"  [weekly] sla failed: {e}")
+        alerts.error("weekly/sla", "metric not written", exc=e)
     return []
 
 
@@ -385,6 +390,7 @@ def _fetch_reports_parallel(headers, org_id, start_ts, end_ts, items: list,
             submitted[entity_name] = rid
         except Exception as e:
             print(f"  [missive] Submit failed for {entity_name}: {e}")
+            alerts.error("weekly/missive", f"analytics report submit failed for {entity_name}", exc=e)
         time.sleep(1.5)
 
     results = {}
@@ -397,6 +403,7 @@ def _fetch_reports_parallel(headers, org_id, start_ts, end_ts, items: list,
                 results[name] = future.result()
             except Exception as e:
                 print(f"  [missive] Poll failed for {name}: {e}")
+                alerts.error("weekly/missive", f"analytics report poll failed for {name}", exc=e)
 
     return results
 

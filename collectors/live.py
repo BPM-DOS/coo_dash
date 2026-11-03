@@ -33,6 +33,7 @@ except ImportError:
     from backports.zoneinfo import ZoneInfo
 
 from airtable_writer import MetricSnapshot, _today
+import alerts
 
 
 AFP_BASE_ID = os.environ.get("AFP_BASE_ID", "appg8MZ0eQP6CFyfZ")
@@ -339,6 +340,7 @@ def _missive() -> list[MetricSnapshot]:
 
     except Exception as e:
         print(f"  [live/missive] failed: {e}")
+        alerts.error("live/missive", "Missive inbox counts failed - inboxes_over_50 shows the fallback value", exc=e)
         return [MetricSnapshot(
             metric="inboxes_over_50",
             category="Communication Backlog",
@@ -500,6 +502,7 @@ def _fetch_reports_parallel(headers, org_id, start_ts, end_ts, items: list,
             submitted[entity_name] = rid
         except Exception as e:
             print(f"  [missive] Submit failed for {entity_name}: {e}")
+            alerts.error("live/missive", f"analytics report submit failed for {entity_name}", exc=e)
         time.sleep(1.5)
 
     results = {}
@@ -512,6 +515,7 @@ def _fetch_reports_parallel(headers, org_id, start_ts, end_ts, items: list,
                 results[name] = future.result()
             except Exception as e:
                 print(f"  [missive] Poll failed for {name}: {e}")
+                alerts.error("live/missive", f"analytics report poll failed for {name}", exc=e)
 
     return results
 

@@ -49,6 +49,7 @@ except ImportError:
     from backports.zoneinfo import ZoneInfo
 
 from airtable_writer import MetricSnapshot
+import alerts
 
 
 BPM_BASE_ID = os.environ.get("BPM_BASE_ID", "apprp203tCiyHl6Dw")
@@ -441,6 +442,7 @@ def _load_vendor_names(afp_key: str) -> list[str]:
         ]
     except Exception as e:
         print(f"  [touchpoint] Could not load vendor names: {e}")
+        alerts.error("touchpoint", "could not load vendor names - vendor matching ran without them", exc=e)
         return []
 
 
