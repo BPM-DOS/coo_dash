@@ -407,16 +407,21 @@ def _discover_teams_live(headers: dict, org_id: str, pages: int = 4) -> dict:
 def _count_team_inbox(headers: dict, team_id: str,
                       max_pages: int = 20, cutoff_days: int = 90) -> tuple[int, int]:
     """
-    Count conversations currently in the team's unassigned inbox using
-    team_inbox={id}, which mirrors exactly what Missive's UI shows as the
-    gray badge count. All returned conversations are unassigned by definition.
-    Returns (assigned_count, unassigned_count) — assigned is always 0 here
-    since team_inbox only surfaces unassigned conversations.
+    Count conversations in the team inbox, split by assigned vs unassigned.
+
+    - Unassigned: team_inbox={id} — mirrors Missive's gray badge exactly.
+    - Assigned: team_all={id} filtered to any user with assigned=True.
+      Assigned conversations reliably clear their flag on close/archive,
+      so team_all is accurate for this subset.
+
+    Returns (assigned_count, unassigned_count).
     """
+    cutoff_ts = int(time.time()) - cutoff_days * 86400
+
+    # --- unassigned: team_inbox is the source of truth ---
     unassigned = 0
     seen_ids: set[str] = set()
-    params = {"team_inbox": team_id, "limit": 50}
-
+    params: dict = {"team_inbox": team_id, "limit": 50}
     for _ in range(max_pages):
         resp = requests.get(f"{MISSIVE_BASE}/conversations", headers=headers,
                             params=params, timeout=30)
@@ -435,7 +440,33 @@ def _count_team_inbox(headers: dict, team_id: str,
         oldest_ts = min(c.get("last_activity_at", 0) for c in convos if isinstance(c, dict))
         params = {"team_inbox": team_id, "limit": 50, "until": oldest_ts}
 
-    return 0, unassigned
+    # --- assigned: team_all filtered to assigned=True ---
+    assigned = 0
+    assigned_seen: set[str] = set()
+    params = {"team_all": team_id, "limit": 50}
+    for _ in range(max_pages):
+        resp = requests.get(f"{MISSIVE_BASE}/conversations", headers=headers,
+                            params=params, timeout=30)
+        if resp.status_code != 200:
+            break
+        convos = resp.json().get("conversations", [])
+        if not convos:
+            break
+        for convo in convos:
+            cid = convo.get("id")
+            if cid and cid not in assigned_seen:
+                users = convo.get("users") or []
+                if any(u.get("assigned") for u in users):
+                    assigned_seen.add(cid)
+                    assigned += 1
+        if len(convos) < 50:
+            break
+        oldest_ts = min(c.get("last_activity_at", 0) for c in convos if isinstance(c, dict))
+        if oldest_ts and oldest_ts < cutoff_ts:
+            break
+        params = {"team_all": team_id, "limit": 50, "until": oldest_ts}
+
+    return assigned, unassigned
 
 
 # ---------------------------------------------------------------------------
